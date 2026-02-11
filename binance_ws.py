@@ -31,9 +31,10 @@ class BinanceFeed:
                 self._connect_count += 1
                 async with websockets.connect(
                     url,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    close_timeout=5,
+                    ping_interval=30,
+                    ping_timeout=20,
+                    close_timeout=10,
+                    max_size=2**20,
                 ) as ws:
                     if self._connect_count > 1:
                         print(f"[BinanceFeed] Reconnected (attempt #{self._connect_count})")

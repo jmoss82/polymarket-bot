@@ -279,6 +279,8 @@ class LiveTrader:
         elif abs_move >= MIN_MOVE_PCT and iv.elapsed > 420:
             strength = "MODERATE"
         else:
+            if abs_move > 0.05:  # close to threshold — log it
+                print(f"  [SIGNAL] {abs_move:.3f}% @ {iv.elapsed:.0f}s — below threshold", flush=True)
             return
 
         signal = "Up" if iv.move_pct > 0 else "Down"
