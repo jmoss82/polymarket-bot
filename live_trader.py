@@ -365,7 +365,7 @@ class LiveTrader:
                 size=size,
                 side="BUY",
             )
-            print(f"  [ORDER] token={token_id[:16]}... price={price} size={size} sig_type={self.clob.signature_type} funder={self.clob.funder}", flush=True)
+            print(f"  [ORDER] token={token_id[:16]}... price={price} size={size}", flush=True)
 
             # Create and sign the order (sync — runs in executor)
             loop = asyncio.get_event_loop()
