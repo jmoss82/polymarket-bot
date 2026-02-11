@@ -160,15 +160,37 @@ class LiveTrader:
         self._trade_placed = False    # have we placed our one trade?
         self._resolved = False        # has it resolved?
 
-        # Init CLOB client
+        # Init CLOB client — derive fresh API creds on startup
+        # (Polymarket L2 keys are IP-bound, so we re-derive each deploy)
         self.clob = ClobClient(
             host=CLOB_HOST,
             chain_id=CHAIN_ID,
             key=POLY_PRIVATE_KEY,
-            creds=ApiCreds(POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE),
-            funder=POLY_FUNDER,
             signature_type=0,
         )
+        print("Deriving API credentials...", flush=True)
+        try:
+            creds = self.clob.derive_api_key()
+            self.clob = ClobClient(
+                host=CLOB_HOST,
+                chain_id=CHAIN_ID,
+                key=POLY_PRIVATE_KEY,
+                creds=ApiCreds(creds.api_key, creds.api_secret, creds.api_passphrase),
+                funder=POLY_FUNDER,
+                signature_type=0,
+            )
+            print(f"API creds derived OK (key: {creds.api_key[:12]}...)", flush=True)
+        except Exception as e:
+            print(f"WARNING: Could not derive creds: {e}", flush=True)
+            print("Falling back to env creds...", flush=True)
+            self.clob = ClobClient(
+                host=CLOB_HOST,
+                chain_id=CHAIN_ID,
+                key=POLY_PRIVATE_KEY,
+                creds=ApiCreds(POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE),
+                funder=POLY_FUNDER,
+                signature_type=0,
+            )
 
     def _get_interval_start(self):
         now = datetime.now(timezone.utc)
