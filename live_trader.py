@@ -16,7 +16,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from binance_ws import BinanceFeed
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from config import (
     POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE,
     POLY_PRIVATE_KEY, POLY_FUNDER, CHAIN_ID, CLOB_HOST,
@@ -25,10 +25,28 @@ import aiohttp
 
 # ── Config ──────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
-BET_SIZE = 5.0           # dollars per trade — start small
-MIN_MOVE_PCT = 0.05      # TEMP: lowered from 0.10 to test order execution
-STRONG_MOVE_PCT = 0.10   # TEMP: lowered from 0.15
-ENTRY_WINDOW = (120, 840)  # TEMP: enter between 2:00 and 14:00
+
+def _env_float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except Exception:
+        return float(default)
+
+def _env_int(name, default):
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return int(default)
+
+BET_SIZE = _env_float("BET_SIZE", 5.0)           # dollars per trade — start small
+MIN_MOVE_PCT = _env_float("MIN_MOVE_PCT", 0.05)  # TEMP: lowered from 0.10 to test order execution
+STRONG_MOVE_PCT = _env_float("STRONG_MOVE_PCT", 0.10)   # TEMP: lowered from 0.15
+ENTRY_WINDOW = (
+    _env_int("ENTRY_START", 120),
+    _env_int("ENTRY_END", 840),
+)
+MIN_EDGE = _env_float("MIN_EDGE", 0.05)
+MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 
 DATA_DIR = "data"
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.json")
@@ -126,6 +144,7 @@ class IntervalState:
         self.low_price = None
         self.trade_taken = False
         self.trade = None
+        self.last_signal_minute = -1
 
     @property
     def elapsed(self):
@@ -148,7 +167,7 @@ class IntervalState:
 
 # ── Live Trader ─────────────────────────────────────────────
 class LiveTrader:
-    def __init__(self, single=False):
+    def __init__(self, single=False, audit=False):
         ensure_dirs()
         self.trades, self.bankroll = load_state()
         self.current_interval = None
@@ -159,6 +178,18 @@ class LiveTrader:
         self._single = single        # single trade mode
         self._trade_placed = False    # have we placed our one trade?
         self._resolved = False        # has it resolved?
+        self._audit = audit
+
+        # Runtime config (can be overridden for audit mode)
+        self.bet_size = BET_SIZE
+        self.min_move_pct = MIN_MOVE_PCT
+        self.strong_move_pct = STRONG_MOVE_PCT
+        self.entry_window = ENTRY_WINDOW
+        self.min_edge = MIN_EDGE
+        self.max_entry_price = MAX_ENTRY_PRICE
+
+        if self._audit:
+            self._apply_audit_overrides()
 
         # Init CLOB client — derive fresh API creds on startup
         # (Polymarket L2 keys are IP-bound, so we re-derive each deploy)
@@ -211,6 +242,16 @@ class LiveTrader:
                 funder=POLY_FUNDER,
                 signature_type=0,
             )
+
+    def _log_balance(self):
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            bal = self.clob.get_balance_allowance(params)
+            print(f"USDC balance/allowance: {bal}", flush=True)
+            log_event("balance", {"balance": bal})
+        except Exception as e:
+            print(f"Balance check failed: {e}", flush=True)
+            log_event("error", {"context": "balance", "error": str(e)})
 
     def _get_interval_start(self):
         now = datetime.now(timezone.utc)
@@ -268,19 +309,22 @@ class LiveTrader:
             print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}")
 
         # Signal logic
-        if iv.trade_taken or iv.elapsed < ENTRY_WINDOW[0] or iv.elapsed > ENTRY_WINDOW[1]:
+        if iv.trade_taken or iv.elapsed < self.entry_window[0] or iv.elapsed > self.entry_window[1]:
             return
         if self._single and self._trade_placed:
             return
 
         abs_move = abs(iv.move_pct)
-        if abs_move >= STRONG_MOVE_PCT:
+        if abs_move >= self.strong_move_pct:
             strength = "STRONG"
-        elif abs_move >= MIN_MOVE_PCT and iv.elapsed > 420:
+        elif abs_move >= self.min_move_pct and iv.elapsed > 420:
             strength = "MODERATE"
         else:
-            if abs_move > 0.03 and int(iv.elapsed) % 60 < 2:  # log ~once per minute
-                print(f"  [SIGNAL] {abs_move:.3f}% @ {iv.elapsed:.0f}s — below threshold", flush=True)
+            if abs_move > 0.03:
+                minute = int(iv.elapsed) // 60
+                if minute != iv.last_signal_minute:
+                    iv.last_signal_minute = minute
+                    print(f"  [SIGNAL] {abs_move:.3f}% @ {iv.elapsed:.0f}s — below threshold", flush=True)
             return
 
         signal = "Up" if iv.move_pct > 0 else "Down"
@@ -303,6 +347,8 @@ class LiveTrader:
             price_up, price_down = float(prices[0]), float(prices[1])
             our_price = price_up if signal == "Up" else price_down
             token_id = clob_ids[0] if signal == "Up" else clob_ids[1]
+            accepting = market.get("acceptingOrders")
+            min_size = market.get("orderMinSize")
 
             if strength == "STRONG":
                 fair = 0.80 if iv.elapsed > 600 else 0.70
@@ -311,15 +357,34 @@ class LiveTrader:
 
             edge = fair - our_price
 
-            if our_price > 0.75 or edge < 0.05:
+            log_event("market_snapshot", {
+                "slug": iv.slug,
+                "signal": signal,
+                "strength": strength,
+                "price_up": price_up,
+                "price_down": price_down,
+                "our_price": our_price,
+                "edge": edge,
+                "accepting_orders": accepting,
+                "order_min_size": min_size,
+            })
+
+            if our_price > self.max_entry_price or edge < self.min_edge:
                 log_event("signal_skip", {
                     "slug": iv.slug, "signal": signal, "strength": strength,
                     "our_price": our_price, "edge": edge, "move": iv.move_pct
                 })
                 return
+            if accepting is False:
+                log_event("signal_skip", {
+                    "slug": iv.slug, "signal": signal, "strength": strength,
+                    "our_price": our_price, "edge": edge, "move": iv.move_pct,
+                    "reason": "acceptingOrders=false",
+                })
+                return
 
             # Place real order
-            order_id = await self._place_order(token_id, our_price, BET_SIZE)
+            order_id = await self._place_order(token_id, our_price, self.bet_size)
 
             if not order_id:
                 return
@@ -328,8 +393,8 @@ class LiveTrader:
             iv.trade = {
                 "side": signal,
                 "entry_price": our_price,
-                "shares": BET_SIZE / our_price,
-                "cost": BET_SIZE,
+                "shares": self.bet_size / our_price,
+                "cost": self.bet_size,
                 "btc_at_entry": btc_price,
                 "btc_open": iv.open_price,
                 "move_at_entry": iv.move_pct,
@@ -343,7 +408,7 @@ class LiveTrader:
                 "order_id": order_id,
                 "ts": time.time(),
             }
-            self.bankroll -= BET_SIZE
+            self.bankroll -= self.bet_size
             save_state(self.trades, self.bankroll)
 
             self._trade_placed = True
@@ -456,11 +521,26 @@ class LiveTrader:
             return
 
         wins = sum(1 for t in self.trades if t.get("won"))
-        print(f"LIVE Trader | BTC 15-Min | ${self.bankroll:.2f} | {wins}/{len(self.trades)} trades")
-        print(f"Bet: ${BET_SIZE} | Min move: {MIN_MOVE_PCT}% | Window: {ENTRY_WINDOW[0]}-{ENTRY_WINDOW[1]}s")
+        mode = "AUDIT" if self._audit else "LIVE"
+        print(f"{mode} Trader | BTC 15-Min | ${self.bankroll:.2f} | {wins}/{len(self.trades)} trades")
+        print(f"Bet: ${self.bet_size} | Min move: {self.min_move_pct}% | Window: {self.entry_window[0]}-{self.entry_window[1]}s")
+        print(f"Edge: >= {self.min_edge} | Max price: {self.max_entry_price}")
         print(f"Logs: {TRADES_CSV}")
         print(f"*** REAL MONEY MODE ***")
+        self._log_balance()
         await self.feed.start()
+
+    def _apply_audit_overrides(self):
+        # Intentionally permissive to guarantee a single live fill quickly.
+        self.bet_size = _env_float("AUDIT_BET_SIZE", 1.0)
+        self.min_move_pct = _env_float("AUDIT_MIN_MOVE_PCT", 0.0)
+        self.strong_move_pct = _env_float("AUDIT_STRONG_MOVE_PCT", 0.0)
+        self.entry_window = (
+            _env_int("AUDIT_ENTRY_START", 30),
+            _env_int("AUDIT_ENTRY_END", 840),
+        )
+        self.min_edge = _env_float("AUDIT_MIN_EDGE", 0.0)
+        self.max_entry_price = _env_float("AUDIT_MAX_ENTRY_PRICE", 0.98)
 
     def summary(self):
         wins = sum(1 for t in self.trades if t.get("won"))
@@ -471,8 +551,13 @@ class LiveTrader:
 if __name__ == "__main__":
     import sys
     single = "--single" in sys.argv
-    trader = LiveTrader(single=single)
-    if single:
+    audit = "--audit" in sys.argv
+    if audit:
+        single = True
+    trader = LiveTrader(single=single, audit=audit)
+    if audit:
+        print("*** AUDIT MODE — single trade with permissive thresholds ***", flush=True)
+    elif single:
         print("*** SINGLE TRADE MODE — will exit after one round trip ***", flush=True)
     try:
         asyncio.run(trader.run())
