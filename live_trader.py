@@ -26,9 +26,9 @@ import aiohttp
 # ── Config ──────────────────────────────────────────────────
 GAMMA_API = "https://gamma-api.polymarket.com"
 BET_SIZE = 5.0           # dollars per trade — start small
-MIN_MOVE_PCT = 0.10
-STRONG_MOVE_PCT = 0.15
-ENTRY_WINDOW = (300, 840)  # enter between 5:00 and 14:00
+MIN_MOVE_PCT = 0.05      # TEMP: lowered from 0.10 to test order execution
+STRONG_MOVE_PCT = 0.10   # TEMP: lowered from 0.15
+ENTRY_WINDOW = (120, 840)  # TEMP: enter between 2:00 and 14:00
 
 DATA_DIR = "data"
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.json")
@@ -279,7 +279,7 @@ class LiveTrader:
         elif abs_move >= MIN_MOVE_PCT and iv.elapsed > 420:
             strength = "MODERATE"
         else:
-            if abs_move > 0.05:  # close to threshold — log it
+            if abs_move > 0.03 and int(iv.elapsed) % 60 < 2:  # log ~once per minute
                 print(f"  [SIGNAL] {abs_move:.3f}% @ {iv.elapsed:.0f}s — below threshold", flush=True)
             return
 
