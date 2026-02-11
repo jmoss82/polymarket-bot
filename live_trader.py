@@ -171,15 +171,35 @@ class LiveTrader:
         print("Deriving API credentials...", flush=True)
         try:
             creds = self.clob.derive_api_key()
+            print(f"Derived creds type: {type(creds)}", flush=True)
+            print(f"Derived creds: {creds}", flush=True)
+
+            # Handle both dict and object responses
+            if isinstance(creds, dict):
+                api_key = creds.get("apiKey") or creds.get("api_key")
+                api_secret = creds.get("secret") or creds.get("api_secret")
+                api_passphrase = creds.get("passphrase") or creds.get("api_passphrase")
+            else:
+                api_key = creds.api_key
+                api_secret = creds.api_secret
+                api_passphrase = creds.api_passphrase
+
             self.clob = ClobClient(
                 host=CLOB_HOST,
                 chain_id=CHAIN_ID,
                 key=POLY_PRIVATE_KEY,
-                creds=ApiCreds(creds.api_key, creds.api_secret, creds.api_passphrase),
+                creds=ApiCreds(api_key, api_secret, api_passphrase),
                 funder=POLY_FUNDER,
                 signature_type=0,
             )
-            print(f"API creds derived OK (key: {creds.api_key[:12]}...)", flush=True)
+            print(f"API creds derived OK (key: {api_key[:12]}...)", flush=True)
+
+            # Quick auth check
+            try:
+                ok = self.clob.get_api_keys()
+                print(f"Auth check: {ok}", flush=True)
+            except Exception as ae:
+                print(f"Auth check failed: {ae}", flush=True)
         except Exception as e:
             print(f"WARNING: Could not derive creds: {e}", flush=True)
             print("Falling back to env creds...", flush=True)
@@ -336,13 +356,14 @@ class LiveTrader:
         """Place a market buy order. Returns order_id or None."""
         try:
             # Build order — buying YES/NO tokens at limit price
-            # Use GTC (good til cancelled) — it'll fill or sit
+            size = round(amount / price, 2)
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price,
-                size=round(amount / price, 2),  # number of shares
+                size=size,
                 side="BUY",
             )
+            print(f"  [ORDER] token={token_id[:16]}... price={price} size={size} sig_type={self.clob.signature_type} funder={self.clob.funder}", flush=True)
 
             # Create and sign the order (sync — runs in executor)
             loop = asyncio.get_event_loop()
