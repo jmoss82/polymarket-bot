@@ -48,6 +48,12 @@ ENTRY_WINDOW = (
 MIN_EDGE = _env_float("MIN_EDGE", 0.05)
 MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 
+# Exit logic
+TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.50)   # sell when position is up +50%
+STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is down -25%
+EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
+MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 10)      # check price every 10 seconds
+
 DATA_DIR = "data"
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.json")
 LOG_FILE = os.path.join(DATA_DIR, "live_log.jsonl")
@@ -129,6 +135,10 @@ def log_event(event_type, data):
             f.write(f"[{ts_str}] {result}: P&L ${data.get('pnl',0):+.2f} | Bankroll: ${data.get('bankroll',0):.2f}\n")
         elif event_type == "order_error":
             f.write(f"[{ts_str}] ORDER ERROR: {data.get('error','')}\n")
+        elif event_type == "exit":
+            f.write(f"[{ts_str}] EXIT ({data.get('reason','')}): sold @ {data.get('exit_price',0):.3f} | P&L ${data.get('pnl',0):+.2f} | Bankroll: ${data.get('bankroll',0):.2f}\n")
+        elif event_type in ("sell_error",):
+            f.write(f"[{ts_str}] SELL ERROR: {data.get('error','')} (reason: {data.get('reason','')})\n")
         elif event_type in ("error", "fatal"):
             f.write(f"[{ts_str}] ERROR: {data.get('error','')}\n")
 
@@ -145,6 +155,12 @@ class IntervalState:
         self.trade_taken = False
         self.trade = None
         self.last_signal_minute = -1
+        # Exit tracking
+        self.exited = False
+        self.exit_reason = None      # "take_profit", "stop_loss", "forced_exit"
+        self.exit_price = None
+        self.exit_pnl = None
+        self.last_monitor_ts = 0     # throttle Polymarket price checks
 
     @property
     def elapsed(self):
@@ -187,6 +203,10 @@ class LiveTrader:
         self.entry_window = ENTRY_WINDOW
         self.min_edge = MIN_EDGE
         self.max_entry_price = MAX_ENTRY_PRICE
+        self.take_profit_pct = TAKE_PROFIT_PCT
+        self.stop_loss_pct = STOP_LOSS_PCT
+        self.exit_before_end = EXIT_BEFORE_END
+        self.monitor_interval = MONITOR_INTERVAL
 
         if self._audit:
             self._apply_audit_overrides()
@@ -333,10 +353,19 @@ class LiveTrader:
         bucket = int(iv.elapsed) // 60
         if bucket > self._last_status_bucket and iv.elapsed > 10:
             self._last_status_bucket = bucket
-            tag = f" [{iv.trade['side']}]" if iv.trade_taken else ""
+            if iv.exited:
+                tag = f" [{iv.trade['side']}] EXITED ({iv.exit_reason})"
+            elif iv.trade_taken:
+                tag = f" [{iv.trade['side']}] OPEN"
+            else:
+                tag = ""
             print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}")
 
-        # Signal logic
+        # Monitor open position for TP/SL/forced exit
+        if iv.trade_taken and iv.trade and not iv.exited:
+            await self._monitor_position(iv)
+
+        # Signal logic — skip if already traded or exited, or outside entry window
         if iv.trade_taken or iv.elapsed < self.entry_window[0] or iv.elapsed > self.entry_window[1]:
             return
         if self._single and self._trade_placed:
@@ -486,8 +515,164 @@ class LiveTrader:
             print(f"  [ORDER ERROR] {e}")
             return None
 
+    async def _monitor_position(self, iv):
+        """Check current market price and decide whether to exit."""
+        now = time.time()
+
+        # Forced exit — sell no matter what with EXIT_BEFORE_END seconds remaining
+        if iv.remaining <= self.exit_before_end:
+            print(f"  [EXIT] Forced exit — {iv.remaining:.0f}s left before resolution", flush=True)
+            await self._sell_position(iv, reason="forced_exit")
+            return
+
+        # Throttle price checks (avoid hammering Gamma API)
+        if now - iv.last_monitor_ts < self.monitor_interval:
+            return
+        iv.last_monitor_ts = now
+
+        # Fetch current market price for our token
+        try:
+            if self._http is None or self._http.closed:
+                self._http = aiohttp.ClientSession()
+
+            market = await self._fetch_market(iv.slug)
+            if not market:
+                return
+
+            prices = json.loads(market.get("outcomePrices", "[]"))
+            clob_ids = json.loads(market.get("clobTokenIds", "[]"))
+            if len(prices) < 2 or len(clob_ids) < 2:
+                return
+
+            # Find current price for the token we hold
+            token_id = iv.trade["token_id"]
+            if clob_ids[0] == token_id:
+                current_price = float(prices[0])
+            elif clob_ids[1] == token_id:
+                current_price = float(prices[1])
+            else:
+                return
+
+            entry_price = iv.trade["entry_price"]
+            position_pnl_pct = (current_price - entry_price) / entry_price
+
+            # Take profit
+            if position_pnl_pct >= self.take_profit_pct:
+                print(f"  [EXIT] Take profit: {position_pnl_pct:+.1%} (entry {entry_price:.3f} -> {current_price:.3f})", flush=True)
+                await self._sell_position(iv, reason="take_profit", sell_price=current_price)
+                return
+
+            # Stop loss
+            if position_pnl_pct <= -self.stop_loss_pct:
+                print(f"  [EXIT] Stop loss: {position_pnl_pct:+.1%} (entry {entry_price:.3f} -> {current_price:.3f})", flush=True)
+                await self._sell_position(iv, reason="stop_loss", sell_price=current_price)
+                return
+
+        except Exception as e:
+            log_event("error", {"context": "monitor_position", "error": str(e)})
+            print(f"  [ERR monitor] {e}", flush=True)
+
+    async def _sell_position(self, iv, reason="manual", sell_price=None):
+        """Sell the current position by placing a SELL order on the CLOB."""
+        trade = iv.trade
+        token_id = trade["token_id"]
+        shares = round(trade["shares"], 2)
+
+        # If we don't have a current market price, fetch it
+        if sell_price is None:
+            try:
+                if self._http is None or self._http.closed:
+                    self._http = aiohttp.ClientSession()
+                market = await self._fetch_market(iv.slug)
+                if market:
+                    prices = json.loads(market.get("outcomePrices", "[]"))
+                    clob_ids = json.loads(market.get("clobTokenIds", "[]"))
+                    if len(prices) >= 2 and len(clob_ids) >= 2:
+                        if clob_ids[0] == token_id:
+                            sell_price = float(prices[0])
+                        elif clob_ids[1] == token_id:
+                            sell_price = float(prices[1])
+            except Exception:
+                pass
+
+        if sell_price is None:
+            # Last resort: sell at a discount to guarantee fill
+            sell_price = max(trade["entry_price"] * 0.5, 0.01)
+            print(f"  [WARN] Could not fetch sell price, using {sell_price:.3f}", flush=True)
+
+        # Sell slightly below market to ensure quick fill (limit order)
+        limit_price = round(max(sell_price - 0.01, 0.01), 2)
+        # Ensure sell order value >= $1
+        if shares * limit_price < 1.0:
+            limit_price = max(limit_price, 0.01)
+            shares = max(shares, round(1.05 / limit_price, 2))
+
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=limit_price,
+                size=shares,
+                side="SELL",
+            )
+            print(f"  [SELL] token={token_id[:16]}... price={limit_price} size={shares} reason={reason}", flush=True)
+
+            loop = asyncio.get_event_loop()
+            signed_order = await loop.run_in_executor(
+                None, lambda: self.clob.create_and_post_order(order_args)
+            )
+
+            order_id = None
+            if signed_order and signed_order.get("orderID"):
+                order_id = signed_order["orderID"]
+            elif signed_order and signed_order.get("success") is False:
+                log_event("sell_error", {"error": str(signed_order), "reason": reason})
+                print(f"  [SELL REJECTED] {signed_order}", flush=True)
+            else:
+                order_id = str(signed_order) if signed_order else None
+
+            if order_id:
+                pnl_est = (limit_price - trade["entry_price"]) * trade["shares"]
+                iv.exited = True
+                iv.exit_reason = reason
+                iv.exit_price = limit_price
+                iv.exit_pnl = round(pnl_est, 2)
+
+                # Credit the estimated sale proceeds back
+                proceeds = limit_price * trade["shares"]
+                self.bankroll += round(proceeds, 2)
+
+                trade["exit_price"] = limit_price
+                trade["exit_reason"] = reason
+                trade["exit_order_id"] = order_id
+                trade["exit_ts"] = time.time()
+                trade["exit_pnl"] = iv.exit_pnl
+
+                save_state(self.trades, self.bankroll)
+
+                print(f"  >> SOLD ({reason}) @ {limit_price:.3f} | est P&L ${pnl_est:+.2f} | order {order_id[:16]}...", flush=True)
+                log_event("exit", {
+                    "slug": iv.slug, "reason": reason,
+                    "entry_price": trade["entry_price"],
+                    "exit_price": limit_price,
+                    "pnl": iv.exit_pnl,
+                    "bankroll": self.bankroll,
+                    "order_id": order_id,
+                })
+            else:
+                print(f"  [SELL FAILED] No order ID returned for {reason}", flush=True)
+                log_event("sell_error", {"reason": reason, "error": "no order_id"})
+
+        except Exception as e:
+            log_event("sell_error", {"error": str(e), "reason": reason})
+            print(f"  [SELL ERROR] {e}", flush=True)
+
     async def _resolve(self, iv):
-        """Resolve a completed interval's trade using Binance price (same as paper)."""
+        """Resolve a completed interval's trade.
+
+        Two paths:
+        1. Early exit (TP/SL/forced) — position already sold, just log final outcome.
+        2. Hold to resolution — original behavior, settle based on BTC close.
+        """
         if not iv.trade:
             return
         trade = iv.trade
@@ -495,29 +680,48 @@ class LiveTrader:
         try:
             went_up = iv.latest_price >= iv.open_price
             winner = "Up" if went_up else "Down"
-            won = trade["side"] == winner
-            payout = trade["shares"] if won else 0
-            pnl = payout - trade["cost"]
-            self.bankroll += payout
-
             trade["winner"] = winner
-            trade["won"] = won
-            trade["pnl"] = round(pnl, 2)
-            trade["payout"] = round(payout, 2)
             trade["btc_close"] = iv.latest_price
             trade["btc_high"] = iv.high_price
             trade["btc_low"] = iv.low_price
             trade["final_move"] = ((iv.latest_price - iv.open_price) / iv.open_price) * 100
 
+            if iv.exited:
+                # Already sold — use the P&L from the sell
+                pnl = iv.exit_pnl or 0
+                won = pnl > 0
+                trade["won"] = won
+                trade["pnl"] = pnl
+                trade["payout"] = round(trade["cost"] + pnl, 2)
+                trade["exit_type"] = iv.exit_reason
+                # Bankroll was already credited in _sell_position
+
+                would_have_won = trade["side"] == winner
+                result = "WIN" if won else "LOSS"
+                held_result = "would've WON" if would_have_won else "would've LOST"
+                print(f"  << {result} ({iv.exit_reason}) | P&L ${pnl:+.2f} | {held_result} if held | Bank ${self.bankroll:.2f}")
+            else:
+                # Held to resolution — original logic
+                won = trade["side"] == winner
+                payout = trade["shares"] if won else 0
+                pnl = payout - trade["cost"]
+                self.bankroll += payout
+
+                trade["won"] = won
+                trade["pnl"] = round(pnl, 2)
+                trade["payout"] = round(payout, 2)
+                trade["exit_type"] = "resolution"
+
+                result = "WIN" if won else "LOSS"
+                print(f"  << {result} | {trade['side']} | BTC {trade['final_move']:+.3f}% | P&L ${pnl:+.2f} | Bank ${self.bankroll:.2f} | {sum(1 for t in self.trades if t.get('won'))}/{len(self.trades)}")
+
             self.trades.append(trade)
             save_state(self.trades, self.bankroll)
 
-            wins = sum(1 for t in self.trades if t.get("won"))
-            result = "WIN" if won else "LOSS"
-            print(f"  << {result} | {trade['side']} | BTC {trade['final_move']:+.3f}% | P&L ${pnl:+.2f} | Bank ${self.bankroll:.2f} | {wins}/{len(self.trades)}")
             log_event("resolve", {
                 "slug": trade["slug"], "won": won, "pnl": pnl,
                 "bankroll": self.bankroll, "winner": winner,
+                "exit_type": trade.get("exit_type"),
                 "order_id": trade.get("order_id"),
             })
 
@@ -557,6 +761,7 @@ class LiveTrader:
         print(f"{mode} Trader | BTC 15-Min | ${self.bankroll:.2f} | {wins}/{len(self.trades)} trades")
         print(f"Bet: ${self.bet_size} | Min move: {self.min_move_pct}% | Window: {self.entry_window[0]}-{self.entry_window[1]}s")
         print(f"Edge: >= {self.min_edge} | Max price: {self.max_entry_price}")
+        print(f"Exit: TP {self.take_profit_pct:+.0%} / SL {-self.stop_loss_pct:+.0%} / Forced @ {self.exit_before_end}s before end | Monitor every {self.monitor_interval}s")
         print(f"Logs: {TRADES_CSV}")
         print(f"*** REAL MONEY MODE ***")
         if not self._log_and_check_funder():
@@ -576,6 +781,11 @@ class LiveTrader:
         )
         self.min_edge = _env_float("AUDIT_MIN_EDGE", 0.0)
         self.max_entry_price = _env_float("AUDIT_MAX_ENTRY_PRICE", 0.98)
+        # Tighter exits for audit — quicker TP/SL to finish the round trip fast
+        self.take_profit_pct = _env_float("AUDIT_TAKE_PROFIT_PCT", 0.15)
+        self.stop_loss_pct = _env_float("AUDIT_STOP_LOSS_PCT", 0.15)
+        self.exit_before_end = _env_int("AUDIT_EXIT_BEFORE_END", 60)
+        self.monitor_interval = _env_int("AUDIT_MONITOR_INTERVAL", 10)
 
     def summary(self):
         wins = sum(1 for t in self.trades if t.get("won"))
