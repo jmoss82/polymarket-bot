@@ -1,5 +1,5 @@
 """
-End-to-end test: check creds → check balance → find market → place $1 order.
+End-to-end test: derive creds -> auth -> balance -> find market -> place $1 order.
 
 Run on Railway (EU) to bypass US geo-blocking.
 Each step prints PASS/FAIL so you know exactly where it breaks.
@@ -17,7 +17,6 @@ from py_clob_client.clob_types import (
     ApiCreds, OrderArgs, BalanceAllowanceParams, AssetType,
 )
 from config import (
-    POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE,
     POLY_PRIVATE_KEY, POLY_FUNDER, CHAIN_ID, CLOB_HOST,
 )
 
@@ -78,44 +77,35 @@ async def main():
             return
         ok("(address not verified)")
 
-    # ── Step 2: API credentials ──────────────────────────────
-    step(2, "API credentials")
+    # ── Step 2: Derive CLOB API credentials ──────────────────
+    step(2, "Derive CLOB API credentials")
+    # Always derive — Builder/env creds are for a different API.
+    # derive_api_key() creates CLOB L2 creds from the private key,
+    # bound to this server's IP.
+    try:
+        l1_client = ClobClient(
+            host=CLOB_HOST,
+            chain_id=CHAIN_ID,
+            key=POLY_PRIVATE_KEY,
+            signature_type=0,
+        )
+        creds = l1_client.derive_api_key()
 
-    # Use Builder creds from .env (these are linked to the proxy wallet)
-    # Only derive if .env creds are missing
-    if POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE:
-        api_key = POLY_API_KEY
-        api_secret = POLY_API_SECRET
-        api_passphrase = POLY_API_PASSPHRASE
-        print(f"  Using Builder creds from env", flush=True)
-        print(f"  API Key: {api_key[:20]}...", flush=True)
+        if isinstance(creds, dict):
+            api_key = creds.get("apiKey") or creds.get("api_key")
+            api_secret = creds.get("secret") or creds.get("api_secret")
+            api_passphrase = creds.get("passphrase") or creds.get("api_passphrase")
+        else:
+            api_key = creds.api_key
+            api_secret = creds.api_secret
+            api_passphrase = creds.api_passphrase
+
+        print(f"  API Key:    {api_key[:20]}...", flush=True)
         ok()
-    else:
-        print(f"  No Builder creds in env — deriving from private key...", flush=True)
-        try:
-            l1_client = ClobClient(
-                host=CLOB_HOST,
-                chain_id=CHAIN_ID,
-                key=POLY_PRIVATE_KEY,
-                signature_type=0,
-            )
-            creds = l1_client.derive_api_key()
-
-            if isinstance(creds, dict):
-                api_key = creds.get("apiKey") or creds.get("api_key")
-                api_secret = creds.get("secret") or creds.get("api_secret")
-                api_passphrase = creds.get("passphrase") or creds.get("api_passphrase")
-            else:
-                api_key = creds.api_key
-                api_secret = creds.api_secret
-                api_passphrase = creds.api_passphrase
-
-            print(f"  Derived API Key: {api_key[:20]}...", flush=True)
-            ok("(derived)")
-        except Exception as e:
-            fail(str(e))
-            traceback.print_exc()
-            return
+    except Exception as e:
+        fail(str(e))
+        traceback.print_exc()
+        return
 
     # ── Step 3: Auth check ───────────────────────────────────
     step(3, "Authenticate")
@@ -130,53 +120,60 @@ async def main():
         )
         keys_resp = client.get_api_keys()
         print(f"  get_api_keys(): {keys_resp}", flush=True)
-
-        # Verify our key is in the response
-        if isinstance(keys_resp, dict):
-            registered_keys = keys_resp.get("apiKeys", [])
-            if api_key in registered_keys:
-                ok(f"Key {api_key[:16]}... is registered")
-            else:
-                print(f"  WARNING: Our key not in registered keys list", flush=True)
-                print(f"  Registered: {registered_keys}", flush=True)
-                print(f"  Ours:       {api_key}", flush=True)
-                ok("(auth responded, but key mismatch — see above)")
-        else:
-            ok()
+        ok()
     except Exception as e:
         fail(str(e))
         traceback.print_exc()
         return
 
-    # ── Step 4: USDC balance ─────────────────────────────────
-    step(4, "USDC balance & allowance")
+    # ── Step 4: USDC balance (info only, don't bail) ─────────
+    step(4, "USDC balance & allowance (info only)")
     try:
         params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
         bal = client.get_balance_allowance(params)
-        print(f"  Raw response: {bal}", flush=True)
+        print(f"  Raw: {bal}", flush=True)
 
-        # Try to extract a human-readable balance
         if isinstance(bal, dict):
             raw_bal = bal.get("balance", "0")
             try:
-                usdc = float(raw_bal) / 1e6   # USDC = 6 decimals
-                print(f"  Parsed USDC: ${usdc:.6f}", flush=True)
-                if usdc < BET_AMOUNT:
-                    fail(f"Balance ${usdc:.2f} < ${BET_AMOUNT:.2f} needed")
-                    print(f"  The CLOB sees $0 for this account.", flush=True)
-                    print(f"  Your proxy wallet has USDC.e on-chain,", flush=True)
-                    print(f"  but allowances may need to be set.", flush=True)
-                    print(f"  Try depositing via Polymarket UI, or", flush=True)
-                    print(f"  check that API creds match the proxy wallet.", flush=True)
-                    return
+                usdc = float(raw_bal) / 1e6
+                print(f"  CLOB sees: ${usdc:.6f}", flush=True)
             except (ValueError, TypeError):
-                print(f"  Could not parse balance — continuing anyway", flush=True)
+                pass
 
+            # Check allowances
+            allowances = bal.get("allowances", {})
+            any_nonzero = any(v != "0" for v in allowances.values())
+            print(f"  Allowances non-zero: {any_nonzero}", flush=True)
+            if not any_nonzero:
+                print(f"  WARNING: All allowances are 0 — exchange can't access funds", flush=True)
+                print(f"  Will attempt order anyway to see exact error...", flush=True)
+
+        # Don't bail — try the order regardless
+        ok("(continuing to order attempt)")
+    except Exception as e:
+        print(f"  Balance check error: {e}", flush=True)
+        print(f"  Continuing anyway...", flush=True)
+
+    # ── Step 4b: Try set_allowances ──────────────────────────
+    step("4b", "Attempt to set allowances")
+    try:
+        print(f"  Calling client.set_allowances()...", flush=True)
+        allowance_result = client.set_allowances()
+        print(f"  Result: {allowance_result}", flush=True)
         ok()
     except Exception as e:
-        fail(str(e))
-        traceback.print_exc()
-        print("  Continuing anyway — balance format may differ", flush=True)
+        print(f"  set_allowances() failed: {e}", flush=True)
+        print(f"  This may need to be done via Polymarket UI instead", flush=True)
+        print(f"  Continuing to order attempt...", flush=True)
+
+    # Re-check balance after allowances
+    try:
+        params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+        bal = client.get_balance_allowance(params)
+        print(f"  Balance after allowances: {bal}", flush=True)
+    except Exception as e:
+        print(f"  Re-check failed: {e}", flush=True)
 
     # ── Step 5: Find an active market ────────────────────────
     step(5, "Find active BTC 15-min market")
@@ -237,7 +234,6 @@ async def main():
     # ── Step 6: Place the order ──────────────────────────────
     step(6, f"Place ${BET_AMOUNT:.0f} BUY order")
 
-    # Pick the cheaper side (easier to fill, less capital at risk)
     price_up = float(prices[0])
     price_down = float(prices[1])
 
@@ -250,7 +246,6 @@ async def main():
         token_id = clob_ids[0]
         raw_price = price_up
 
-    # Round price to 2 decimals (Polymarket tick size = 0.01)
     price = round(raw_price, 2)
     if price < 0.01:
         price = 0.01
@@ -259,7 +254,6 @@ async def main():
 
     size = round(BET_AMOUNT / price, 2)
 
-    # Respect minimum order size if known
     if min_size:
         try:
             ms = float(min_size)
