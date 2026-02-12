@@ -54,6 +54,9 @@ STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is 
 EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
 MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 10)      # check price every 10 seconds
 
+# Risk management
+MAX_SESSION_LOSS = _env_float("MAX_SESSION_LOSS", 15.0)  # stop trading after $15 cumulative loss
+
 DATA_DIR = "data"
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.json")
 LOG_FILE = os.path.join(DATA_DIR, "live_log.jsonl")
@@ -208,6 +211,9 @@ class LiveTrader:
         self.stop_loss_pct = STOP_LOSS_PCT
         self.exit_before_end = EXIT_BEFORE_END
         self.monitor_interval = MONITOR_INTERVAL
+        self.max_session_loss = MAX_SESSION_LOSS
+        self.session_pnl = 0.0          # tracks cumulative P&L this session
+        self._circuit_breaker = False    # set True when max loss hit
 
         if self._audit:
             self._apply_audit_overrides()
@@ -366,6 +372,10 @@ class LiveTrader:
         if iv.trade_taken and iv.trade and not iv.exited:
             await self._monitor_position(iv)
 
+        # Circuit breaker — stop trading if max session loss exceeded
+        if self._circuit_breaker:
+            return
+
         # Signal logic — skip if already traded or exited, or outside entry window
         if iv.trade_taken or iv.elapsed < self.entry_window[0] or iv.elapsed > self.entry_window[1]:
             return
@@ -450,12 +460,24 @@ class LiveTrader:
 
             if not order_id:
                 return
+
+            # Confirm fill — poll order status (don't assume filled just because we got an orderID)
+            filled_size, fill_price = await self._confirm_fill(order_id)
+            if filled_size <= 0:
+                print(f"  [SKIP] Order {order_id[:16]}... not filled — no position", flush=True)
+                log_event("order_unfilled", {"order_id": order_id, "token_id": token_id})
+                return
+
+            # Use actual fill data for position tracking
+            actual_cost = round(filled_size * fill_price, 4)
+
             iv.trade = {
                 "side": signal,
-                "entry_price": buy_price,
+                "entry_price": fill_price,
                 "market_price_at_entry": our_price,
-                "shares": self.bet_size / buy_price,
-                "cost": self.bet_size,
+                "limit_price": buy_price,
+                "shares": filled_size,
+                "cost": actual_cost,
                 "btc_at_entry": btc_price,
                 "btc_open": iv.open_price,
                 "move_at_entry": iv.move_pct,
@@ -469,11 +491,11 @@ class LiveTrader:
                 "order_id": order_id,
                 "ts": time.time(),
             }
-            self.bankroll -= self.bet_size
+            self.bankroll -= actual_cost
             save_state(self.trades, self.bankroll)
 
             self._trade_placed = True
-            print(f"  >> LIVE {strength} {signal} @ {buy_price:.2f} (mkt {our_price:.2f}) | edge {edge:+.2f} | order {order_id[:16]}...", flush=True)
+            print(f"  >> FILLED {strength} {signal} | {filled_size} shares @ {fill_price:.3f} (limit {buy_price:.2f}) | cost ${actual_cost:.2f} | order {order_id[:16]}...", flush=True)
             log_event("entry", {**iv.trade})
 
         except Exception as e:
@@ -481,7 +503,7 @@ class LiveTrader:
             print(f"  [ERR evaluate] {e}")
 
     async def _place_order(self, token_id, price, amount):
-        """Place a market buy order. Returns order_id or None."""
+        """Place a limit buy order. Returns order_id or None."""
         try:
             # Build order — buying YES/NO tokens at limit price
             # Ensure order value >= $1 (Polymarket minimum)
@@ -502,24 +524,99 @@ class LiveTrader:
                 None, lambda: self.clob.create_and_post_order(order_args)
             )
 
+            order_id = None
             if signed_order and signed_order.get("orderID"):
-                return signed_order["orderID"]
+                order_id = signed_order["orderID"]
             elif signed_order and signed_order.get("success") is False:
                 log_event("order_error", {"error": str(signed_order), "token_id": token_id})
                 print(f"  [ORDER REJECTED] {signed_order}")
                 return None
             else:
-                # Some versions return differently
                 order_id = str(signed_order) if signed_order else None
-                return order_id
+
+            if not order_id:
+                return None
+
+            return order_id
 
         except Exception as e:
             log_event("order_error", {"error": str(e), "token_id": token_id})
             print(f"  [ORDER ERROR] {e}")
             return None
 
+    async def _confirm_fill(self, order_id, max_wait=5.0):
+        """Poll order status to confirm fill. Returns (filled_size, avg_price) or (0, 0)."""
+        loop = asyncio.get_event_loop()
+        poll_interval = 1.0
+        elapsed = 0.0
+
+        while elapsed < max_wait:
+            try:
+                order = await loop.run_in_executor(
+                    None, lambda: self.clob.get_order(order_id)
+                )
+
+                if not order:
+                    print(f"  [FILL] No order data for {order_id[:16]}...", flush=True)
+                    await asyncio.sleep(poll_interval)
+                    elapsed += poll_interval
+                    continue
+
+                # Handle both dict and object responses
+                if isinstance(order, dict):
+                    size_matched = float(order.get("size_matched", 0))
+                    original_size = float(order.get("original_size", 0))
+                    price = float(order.get("price", 0))
+                    status = order.get("status", "unknown")
+                else:
+                    size_matched = float(getattr(order, "size_matched", 0))
+                    original_size = float(getattr(order, "original_size", 0))
+                    price = float(getattr(order, "price", 0))
+                    status = getattr(order, "status", "unknown")
+
+                print(f"  [FILL] status={status} filled={size_matched}/{original_size}", flush=True)
+
+                if size_matched > 0:
+                    # Partially or fully filled — use what we got
+                    return size_matched, price
+
+                # If order is dead (cancelled, expired) with no fill, bail
+                if status in ("CANCELED", "CANCELLED", "EXPIRED"):
+                    print(f"  [FILL] Order {status} with 0 fill", flush=True)
+                    return 0, 0
+
+            except Exception as e:
+                print(f"  [FILL] Poll error: {e}", flush=True)
+
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
+        print(f"  [FILL] Timed out after {max_wait}s — assuming unfilled", flush=True)
+        return 0, 0
+
+    async def _get_clob_midpoint(self, token_id):
+        """Get live midpoint price from CLOB orderbook (not cached Gamma API)."""
+        loop = asyncio.get_event_loop()
+        mid = await loop.run_in_executor(
+            None, lambda: self.clob.get_midpoint(token_id)
+        )
+        # Returns string like "0.55" or a dict — handle both
+        if isinstance(mid, dict):
+            return float(mid.get("mid", 0))
+        return float(mid)
+
+    async def _get_clob_price(self, token_id, side="SELL"):
+        """Get live bid/ask price from CLOB orderbook."""
+        loop = asyncio.get_event_loop()
+        price = await loop.run_in_executor(
+            None, lambda: self.clob.get_price(token_id, side)
+        )
+        if isinstance(price, dict):
+            return float(price.get("price", 0))
+        return float(price)
+
     async def _monitor_position(self, iv):
-        """Check current market price and decide whether to exit."""
+        """Check current market price via CLOB orderbook and decide whether to exit."""
         now = time.time()
 
         # Forced exit — sell no matter what with EXIT_BEFORE_END seconds remaining
@@ -528,35 +625,18 @@ class LiveTrader:
             await self._sell_position(iv, reason="forced_exit")
             return
 
-        # Throttle price checks (avoid hammering Gamma API)
+        # Throttle CLOB price checks
         if now - iv.last_monitor_ts < self.monitor_interval:
             return
         iv.last_monitor_ts = now
 
-        # Fetch current market price for our token
+        # Fetch live midpoint from CLOB orderbook (not Gamma)
         try:
-            if self._http is None or self._http.closed:
-                self._http = aiohttp.ClientSession()
-
-            market = await self._fetch_market(iv.slug)
-            if not market:
-                print(f"  [MON] No market data for {iv.slug}", flush=True)
-                return
-
-            prices = json.loads(market.get("outcomePrices", "[]"))
-            clob_ids = json.loads(market.get("clobTokenIds", "[]"))
-            if len(prices) < 2 or len(clob_ids) < 2:
-                print(f"  [MON] Incomplete market data: prices={prices} ids={len(clob_ids)}", flush=True)
-                return
-
-            # Find current price for the token we hold
             token_id = iv.trade["token_id"]
-            if clob_ids[0] == token_id:
-                current_price = float(prices[0])
-            elif clob_ids[1] == token_id:
-                current_price = float(prices[1])
-            else:
-                print(f"  [MON] Token ID mismatch: held={token_id[:16]}... market={clob_ids[0][:16]}...|{clob_ids[1][:16]}...", flush=True)
+            current_price = await self._get_clob_midpoint(token_id)
+
+            if not current_price or current_price <= 0:
+                print(f"  [MON] No CLOB price for token {token_id[:16]}...", flush=True)
                 return
 
             entry_price = iv.trade["entry_price"]
@@ -595,24 +675,19 @@ class LiveTrader:
 
         trade = iv.trade
         token_id = trade["token_id"]
-        shares = round(trade["shares"], 2)
+        shares = round(trade["shares"], 2)  # actual filled shares — never exceed this
 
-        # If we don't have a current market price, fetch it
+        # If we don't have a current market price, get live bid from CLOB
         if sell_price is None:
             try:
-                if self._http is None or self._http.closed:
-                    self._http = aiohttp.ClientSession()
-                market = await self._fetch_market(iv.slug)
-                if market:
-                    prices = json.loads(market.get("outcomePrices", "[]"))
-                    clob_ids = json.loads(market.get("clobTokenIds", "[]"))
-                    if len(prices) >= 2 and len(clob_ids) >= 2:
-                        if clob_ids[0] == token_id:
-                            sell_price = float(prices[0])
-                        elif clob_ids[1] == token_id:
-                            sell_price = float(prices[1])
-            except Exception:
-                pass
+                sell_price = await self._get_clob_price(token_id, side="SELL")
+                if sell_price and sell_price > 0:
+                    print(f"  [SELL] CLOB bid price: {sell_price:.3f}", flush=True)
+                else:
+                    sell_price = None
+            except Exception as e:
+                print(f"  [SELL] CLOB price fetch failed: {e}", flush=True)
+                sell_price = None
 
         if sell_price is None:
             # Last resort: sell at a discount to guarantee fill
@@ -621,10 +696,18 @@ class LiveTrader:
 
         # Sell slightly below market to ensure quick fill (limit order)
         limit_price = round(max(sell_price - 0.01, 0.01), 2)
-        # Ensure sell order value >= $1
-        if shares * limit_price < 1.0:
-            limit_price = max(limit_price, 0.01)
-            shares = max(shares, round(1.05 / limit_price, 2))
+
+        # Check if sell meets $1 minimum — NEVER inflate shares beyond what we own
+        order_value = shares * limit_price
+        if order_value < 1.0:
+            print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {limit_price}) — cannot sell", flush=True)
+            log_event("sell_error", {"reason": reason, "error": f"below $1 min: {shares} shares @ {limit_price}"})
+            # On forced exit, mark as exited anyway to avoid infinite retries
+            if reason == "forced_exit":
+                iv.exited = True
+                iv.exit_reason = "forced_exit_below_min"
+                iv.exit_pnl = 0
+            return
 
         try:
             order_args = OrderArgs(
@@ -737,11 +820,19 @@ class LiveTrader:
             self.trades.append(trade)
             save_state(self.trades, self.bankroll)
 
+            # Track session P&L and check circuit breaker
+            self.session_pnl += pnl
+            if self.session_pnl <= -self.max_session_loss and not self._circuit_breaker:
+                self._circuit_breaker = True
+                print(f"  *** CIRCUIT BREAKER *** Session P&L ${self.session_pnl:+.2f} hit max loss ${-self.max_session_loss:.2f} — no more trades", flush=True)
+                log_event("circuit_breaker", {"session_pnl": self.session_pnl, "max_loss": self.max_session_loss})
+
             log_event("resolve", {
                 "slug": trade["slug"], "won": won, "pnl": pnl,
                 "bankroll": self.bankroll, "winner": winner,
                 "exit_type": trade.get("exit_type"),
                 "order_id": trade.get("order_id"),
+                "session_pnl": self.session_pnl,
             })
 
             if self._single:
@@ -781,6 +872,7 @@ class LiveTrader:
         print(f"Bet: ${self.bet_size} | Min move: {self.min_move_pct}% | Window: {self.entry_window[0]}-{self.entry_window[1]}s")
         print(f"Edge: >= {self.min_edge} | Max price: {self.max_entry_price}")
         print(f"Exit: TP {self.take_profit_pct:+.0%} / SL {-self.stop_loss_pct:+.0%} / Forced @ {self.exit_before_end}s before end | Monitor every {self.monitor_interval}s")
+        print(f"Risk: Max session loss ${self.max_session_loss:.0f}")
         print(f"Logs: {TRADES_CSV}")
         print(f"*** REAL MONEY MODE ***")
         if not self._log_and_check_funder():
