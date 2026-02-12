@@ -87,7 +87,7 @@ async def main():
             host=CLOB_HOST,
             chain_id=CHAIN_ID,
             key=POLY_PRIVATE_KEY,
-            signature_type=0,
+            signature_type=2,  # POLY_GNOSIS_SAFE — MetaMask proxy wallet
         )
         creds = l1_client.derive_api_key()
 
@@ -116,7 +116,7 @@ async def main():
             key=POLY_PRIVATE_KEY,
             creds=ApiCreds(api_key, api_secret, api_passphrase),
             funder=funder,
-            signature_type=0,
+            signature_type=2,  # POLY_GNOSIS_SAFE — MetaMask proxy wallet
         )
         keys_resp = client.get_api_keys()
         print(f"  get_api_keys(): {keys_resp}", flush=True)
