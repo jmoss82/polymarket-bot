@@ -161,6 +161,7 @@ class IntervalState:
         self.exit_price = None
         self.exit_pnl = None
         self.last_monitor_ts = 0     # throttle Polymarket price checks
+        self.sell_attempts = 0       # cap retries on failed sells
 
     @property
     def elapsed(self):
@@ -440,8 +441,9 @@ class LiveTrader:
                 })
                 return
 
-            # Place real order
-            order_id = await self._place_order(token_id, our_price, self.bet_size)
+            # Place real order — price 2 cents above market to cross the spread and fill immediately
+            buy_price = round(min(our_price + 0.02, 0.99), 2)
+            order_id = await self._place_order(token_id, buy_price, self.bet_size)
 
             # Mark trade taken regardless of success to prevent retry spam
             iv.trade_taken = True
@@ -450,8 +452,9 @@ class LiveTrader:
                 return
             iv.trade = {
                 "side": signal,
-                "entry_price": our_price,
-                "shares": self.bet_size / our_price,
+                "entry_price": buy_price,
+                "market_price_at_entry": our_price,
+                "shares": self.bet_size / buy_price,
                 "cost": self.bet_size,
                 "btc_at_entry": btc_price,
                 "btc_open": iv.open_price,
@@ -470,7 +473,7 @@ class LiveTrader:
             save_state(self.trades, self.bankroll)
 
             self._trade_placed = True
-            print(f"  >> LIVE {strength} {signal} @ {our_price:.2f} | edge {edge:+.2f} | order {order_id[:16]}...", flush=True)
+            print(f"  >> LIVE {strength} {signal} @ {buy_price:.2f} (mkt {our_price:.2f}) | edge {edge:+.2f} | order {order_id[:16]}...", flush=True)
             log_event("entry", {**iv.trade})
 
         except Exception as e:
@@ -537,11 +540,13 @@ class LiveTrader:
 
             market = await self._fetch_market(iv.slug)
             if not market:
+                print(f"  [MON] No market data for {iv.slug}", flush=True)
                 return
 
             prices = json.loads(market.get("outcomePrices", "[]"))
             clob_ids = json.loads(market.get("clobTokenIds", "[]"))
             if len(prices) < 2 or len(clob_ids) < 2:
+                print(f"  [MON] Incomplete market data: prices={prices} ids={len(clob_ids)}", flush=True)
                 return
 
             # Find current price for the token we hold
@@ -551,10 +556,14 @@ class LiveTrader:
             elif clob_ids[1] == token_id:
                 current_price = float(prices[1])
             else:
+                print(f"  [MON] Token ID mismatch: held={token_id[:16]}... market={clob_ids[0][:16]}...|{clob_ids[1][:16]}...", flush=True)
                 return
 
             entry_price = iv.trade["entry_price"]
             position_pnl_pct = (current_price - entry_price) / entry_price
+
+            # Log position status on each check
+            print(f"  [MON] {iv.trade['side']} | entry {entry_price:.3f} -> {current_price:.3f} | P&L {position_pnl_pct:+.1%} | {iv.remaining:.0f}s left", flush=True)
 
             # Take profit
             if position_pnl_pct >= self.take_profit_pct:
@@ -574,6 +583,16 @@ class LiveTrader:
 
     async def _sell_position(self, iv, reason="manual", sell_price=None):
         """Sell the current position by placing a SELL order on the CLOB."""
+        MAX_SELL_ATTEMPTS = 3
+        iv.sell_attempts += 1
+        if iv.sell_attempts > MAX_SELL_ATTEMPTS:
+            print(f"  [SELL GAVE UP] {iv.sell_attempts - 1} failed attempts — marking exited", flush=True)
+            iv.exited = True
+            iv.exit_reason = f"{reason}_failed"
+            iv.exit_pnl = 0  # unknown, couldn't sell
+            log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} attempts"})
+            return
+
         trade = iv.trade
         token_id = trade["token_id"]
         shares = round(trade["shares"], 2)
