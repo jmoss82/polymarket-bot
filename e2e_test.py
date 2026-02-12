@@ -1,5 +1,5 @@
 """
-End-to-end test: derive creds → check balance → find market → place $1 order.
+End-to-end test: check creds → check balance → find market → place $1 order.
 
 Run on Railway (EU) to bypass US geo-blocking.
 Each step prints PASS/FAIL so you know exactly where it breaks.
@@ -16,7 +16,10 @@ from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import (
     ApiCreds, OrderArgs, BalanceAllowanceParams, AssetType,
 )
-from config import POLY_PRIVATE_KEY, POLY_FUNDER, CHAIN_ID, CLOB_HOST
+from config import (
+    POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE,
+    POLY_PRIVATE_KEY, POLY_FUNDER, CHAIN_ID, CLOB_HOST,
+)
 
 GAMMA_API = "https://gamma-api.polymarket.com"
 BET_AMOUNT = 1.0  # dollars — tiny test order
@@ -44,8 +47,8 @@ async def main():
 
     funder = POLY_FUNDER
 
-    # ── Step 1: Private key ──────────────────────────────────
-    step(1, "Private key + wallet address")
+    # ── Step 1: Private key + addresses ──────────────────────
+    step(1, "Private key + wallet addresses")
     if not POLY_PRIVATE_KEY:
         fail("POLY_PRIVATE_KEY is not set")
         return
@@ -60,12 +63,12 @@ async def main():
 
         if funder:
             if derived_addr.lower() == funder.lower():
-                print(f"  Funder = EOA (self-custodial wallet)", flush=True)
+                print(f"  Mode: self-custodial (funder = EOA)", flush=True)
             else:
-                print(f"  Funder != EOA (proxy wallet — this is normal for MetaMask accounts)", flush=True)
+                print(f"  Mode: proxy wallet (funder != EOA)", flush=True)
         else:
-            print(f"  POLY_FUNDER not set — using EOA as funder", flush=True)
-            funder = derived_addr
+            fail("POLY_FUNDER is not set")
+            return
 
         ok()
     except ImportError:
@@ -75,37 +78,47 @@ async def main():
             return
         ok("(address not verified)")
 
-    # ── Step 2: Derive L2 API credentials ────────────────────
-    step(2, "Derive L2 API credentials (IP-bound)")
-    try:
-        l1_client = ClobClient(
-            host=CLOB_HOST,
-            chain_id=CHAIN_ID,
-            key=POLY_PRIVATE_KEY,
-            signature_type=0,
-        )
-        creds = l1_client.derive_api_key()
+    # ── Step 2: API credentials ──────────────────────────────
+    step(2, "API credentials")
 
-        if isinstance(creds, dict):
-            api_key = creds.get("apiKey") or creds.get("api_key")
-            api_secret = creds.get("secret") or creds.get("api_secret")
-            api_passphrase = creds.get("passphrase") or creds.get("api_passphrase")
-        else:
-            api_key = creds.api_key
-            api_secret = creds.api_secret
-            api_passphrase = creds.api_passphrase
-
-        print(f"  API Key:    {api_key[:20]}...", flush=True)
-        print(f"  Secret:     {api_secret[:20]}...", flush=True)
-        print(f"  Passphrase: {api_passphrase[:20]}...", flush=True)
+    # Use Builder creds from .env (these are linked to the proxy wallet)
+    # Only derive if .env creds are missing
+    if POLY_API_KEY and POLY_API_SECRET and POLY_API_PASSPHRASE:
+        api_key = POLY_API_KEY
+        api_secret = POLY_API_SECRET
+        api_passphrase = POLY_API_PASSPHRASE
+        print(f"  Using Builder creds from env", flush=True)
+        print(f"  API Key: {api_key[:20]}...", flush=True)
         ok()
-    except Exception as e:
-        fail(str(e))
-        traceback.print_exc()
-        return
+    else:
+        print(f"  No Builder creds in env — deriving from private key...", flush=True)
+        try:
+            l1_client = ClobClient(
+                host=CLOB_HOST,
+                chain_id=CHAIN_ID,
+                key=POLY_PRIVATE_KEY,
+                signature_type=0,
+            )
+            creds = l1_client.derive_api_key()
+
+            if isinstance(creds, dict):
+                api_key = creds.get("apiKey") or creds.get("api_key")
+                api_secret = creds.get("secret") or creds.get("api_secret")
+                api_passphrase = creds.get("passphrase") or creds.get("api_passphrase")
+            else:
+                api_key = creds.api_key
+                api_secret = creds.api_secret
+                api_passphrase = creds.api_passphrase
+
+            print(f"  Derived API Key: {api_key[:20]}...", flush=True)
+            ok("(derived)")
+        except Exception as e:
+            fail(str(e))
+            traceback.print_exc()
+            return
 
     # ── Step 3: Auth check ───────────────────────────────────
-    step(3, "Authenticate with derived creds")
+    step(3, "Authenticate")
     try:
         client = ClobClient(
             host=CLOB_HOST,
@@ -117,7 +130,19 @@ async def main():
         )
         keys_resp = client.get_api_keys()
         print(f"  get_api_keys(): {keys_resp}", flush=True)
-        ok()
+
+        # Verify our key is in the response
+        if isinstance(keys_resp, dict):
+            registered_keys = keys_resp.get("apiKeys", [])
+            if api_key in registered_keys:
+                ok(f"Key {api_key[:16]}... is registered")
+            else:
+                print(f"  WARNING: Our key not in registered keys list", flush=True)
+                print(f"  Registered: {registered_keys}", flush=True)
+                print(f"  Ours:       {api_key}", flush=True)
+                ok("(auth responded, but key mismatch — see above)")
+        else:
+            ok()
     except Exception as e:
         fail(str(e))
         traceback.print_exc()
@@ -138,7 +163,11 @@ async def main():
                 print(f"  Parsed USDC: ${usdc:.6f}", flush=True)
                 if usdc < BET_AMOUNT:
                     fail(f"Balance ${usdc:.2f} < ${BET_AMOUNT:.2f} needed")
-                    print(f"  Deposit USDC to your Polymarket wallet first", flush=True)
+                    print(f"  The CLOB sees $0 for this account.", flush=True)
+                    print(f"  Your proxy wallet has USDC.e on-chain,", flush=True)
+                    print(f"  but allowances may need to be set.", flush=True)
+                    print(f"  Try depositing via Polymarket UI, or", flush=True)
+                    print(f"  check that API creds match the proxy wallet.", flush=True)
                     return
             except (ValueError, TypeError):
                 print(f"  Could not parse balance — continuing anyway", flush=True)
