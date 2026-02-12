@@ -254,16 +254,20 @@ class LiveTrader:
             log_event("error", {"context": "balance", "error": str(e)})
 
     def _log_and_check_funder(self):
-        """Ensure POLY_FUNDER matches the address derived from POLY_PRIVATE_KEY."""
+        """Log wallet addresses and verify POLY_FUNDER is set."""
         try:
             from eth_account import Account
         except Exception as e:
             print(f"WARNING: Cannot import eth_account to verify funder address: {e}", flush=True)
+            if not POLY_FUNDER:
+                print("FATAL: POLY_FUNDER is missing.", flush=True)
+                return False
             return True
 
         try:
             derived = Account.from_key(POLY_PRIVATE_KEY).address
-            print(f"Derived address: {derived}", flush=True)
+            print(f"EOA (signer): {derived}", flush=True)
+            print(f"Funder:       {POLY_FUNDER}", flush=True)
             log_event("wallet", {"derived_address": derived, "funder": POLY_FUNDER})
 
             if not POLY_FUNDER:
@@ -271,9 +275,8 @@ class LiveTrader:
                 return False
 
             if derived.lower() != POLY_FUNDER.lower():
-                print("FATAL: POLY_FUNDER does not match POLY_PRIVATE_KEY.", flush=True)
-                print("Set POLY_FUNDER to the derived address shown above.", flush=True)
-                return False
+                print("Funder != EOA (proxy wallet mode)", flush=True)
+
             return True
         except Exception as e:
             print(f"FATAL: Could not derive address from POLY_PRIVATE_KEY: {e}", flush=True)

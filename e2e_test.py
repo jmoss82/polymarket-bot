@@ -55,19 +55,16 @@ async def main():
     try:
         from eth_account import Account
         derived_addr = Account.from_key(POLY_PRIVATE_KEY).address
-        print(f"  Derived address: {derived_addr}", flush=True)
+        print(f"  EOA (signer):  {derived_addr}", flush=True)
+        print(f"  POLY_FUNDER:   {funder or '(not set)'}", flush=True)
 
         if funder:
             if derived_addr.lower() == funder.lower():
-                print(f"  POLY_FUNDER matches: {funder}", flush=True)
+                print(f"  Funder = EOA (self-custodial wallet)", flush=True)
             else:
-                fail(f"POLY_FUNDER mismatch!")
-                print(f"    POLY_FUNDER  = {funder}", flush=True)
-                print(f"    Derived addr = {derived_addr}", flush=True)
-                print(f"  Fix: set POLY_FUNDER={derived_addr}", flush=True)
-                return
+                print(f"  Funder != EOA (proxy wallet — this is normal for MetaMask accounts)", flush=True)
         else:
-            print(f"  POLY_FUNDER not set — using derived address", flush=True)
+            print(f"  POLY_FUNDER not set — using EOA as funder", flush=True)
             funder = derived_addr
 
         ok()
