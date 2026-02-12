@@ -360,10 +360,12 @@ class LiveTrader:
         bucket = int(iv.elapsed) // 60
         if bucket > self._last_status_bucket and iv.elapsed > 10:
             self._last_status_bucket = bucket
-            if iv.exited:
+            if iv.exited and iv.trade:
                 tag = f" [{iv.trade['side']}] EXITED ({iv.exit_reason})"
-            elif iv.trade_taken:
+            elif iv.trade_taken and iv.trade:
                 tag = f" [{iv.trade['side']}] OPEN"
+            elif iv.trade_taken:
+                tag = " [no fill]"
             else:
                 tag = ""
             print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}")
@@ -544,22 +546,24 @@ class LiveTrader:
             print(f"  [ORDER ERROR] {e}")
             return None
 
-    async def _confirm_fill(self, order_id, max_wait=5.0):
-        """Poll order status to confirm fill. Returns (filled_size, avg_price) or (0, 0)."""
+    async def _confirm_fill(self, order_id, max_wait=15.0):
+        """Poll order status to confirm fill. Returns (filled_size, avg_price) or (0, 0).
+        If unfilled after max_wait, cancels the order to prevent ghost fills."""
         loop = asyncio.get_event_loop()
-        poll_interval = 1.0
+        poll_interval = 2.0
         elapsed = 0.0
 
         while elapsed < max_wait:
+            await asyncio.sleep(poll_interval)
+            elapsed += poll_interval
+
             try:
                 order = await loop.run_in_executor(
                     None, lambda: self.clob.get_order(order_id)
                 )
 
                 if not order:
-                    print(f"  [FILL] No order data for {order_id[:16]}...", flush=True)
-                    await asyncio.sleep(poll_interval)
-                    elapsed += poll_interval
+                    print(f"  [FILL] No order data for {order_id[:16]}... ({elapsed:.0f}s)", flush=True)
                     continue
 
                 # Handle both dict and object responses
@@ -574,24 +578,46 @@ class LiveTrader:
                     price = float(getattr(order, "price", 0))
                     status = getattr(order, "status", "unknown")
 
-                print(f"  [FILL] status={status} filled={size_matched}/{original_size}", flush=True)
+                print(f"  [FILL] status={status} filled={size_matched}/{original_size} ({elapsed:.0f}s)", flush=True)
 
                 if size_matched > 0:
                     # Partially or fully filled — use what we got
                     return size_matched, price
 
-                # If order is dead (cancelled, expired) with no fill, bail
-                if status in ("CANCELED", "CANCELLED", "EXPIRED"):
+                # If order is already dead with no fill, bail
+                if status in ("CANCELED", "CANCELLED", "EXPIRED", "MATCHED"):
+                    if status == "MATCHED":
+                        # Fully matched — size_matched might be reported as 0 due to timing
+                        return original_size, price
                     print(f"  [FILL] Order {status} with 0 fill", flush=True)
                     return 0, 0
 
             except Exception as e:
                 print(f"  [FILL] Poll error: {e}", flush=True)
 
-            await asyncio.sleep(poll_interval)
-            elapsed += poll_interval
+        # Timed out — cancel the order so it doesn't fill later without our knowledge
+        print(f"  [FILL] Timed out after {max_wait:.0f}s — cancelling order", flush=True)
+        try:
+            await loop.run_in_executor(
+                None, lambda: self.clob.cancel(order_id)
+            )
+            print(f"  [FILL] Order cancelled", flush=True)
+        except Exception as e:
+            print(f"  [FILL] Cancel failed: {e} — order may still fill!", flush=True)
+            # One last check after cancel attempt
+            try:
+                order = await loop.run_in_executor(
+                    None, lambda: self.clob.get_order(order_id)
+                )
+                if order:
+                    sm = float(order.get("size_matched", 0) if isinstance(order, dict) else getattr(order, "size_matched", 0))
+                    if sm > 0:
+                        price = float(order.get("price", 0) if isinstance(order, dict) else getattr(order, "price", 0))
+                        print(f"  [FILL] Order filled {sm} after cancel attempt!", flush=True)
+                        return sm, price
+            except Exception:
+                pass
 
-        print(f"  [FILL] Timed out after {max_wait}s — assuming unfilled", flush=True)
         return 0, 0
 
     async def _get_clob_midpoint(self, token_id):
