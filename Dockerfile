@@ -9,4 +9,8 @@ COPY . .
 
 RUN mkdir -p data logs
 
-CMD ["python", "-u", "live_trader.py"]
+# Switch between test and live:
+#   Test:  python -u e2e_test.py
+#   Live:  python -u live_trader.py
+#   Audit: python -u live_trader.py --audit
+CMD ["python", "-u", "e2e_test.py"]
