@@ -13,4 +13,4 @@ RUN mkdir -p data logs
 #   Test:  python -u e2e_test.py
 #   Live:  python -u live_trader.py
 #   Audit: python -u live_trader.py --audit
-CMD ["python", "-u", "e2e_test.py"]
+CMD ["python", "-u", "live_trader.py", "--audit"]

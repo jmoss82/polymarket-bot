@@ -193,17 +193,16 @@ class LiveTrader:
 
         # Init CLOB client — derive fresh API creds on startup
         # (Polymarket L2 keys are IP-bound, so we re-derive each deploy)
+        # signature_type=2 (POLY_GNOSIS_SAFE) for MetaMask proxy wallet accounts
         self.clob = ClobClient(
             host=CLOB_HOST,
             chain_id=CHAIN_ID,
             key=POLY_PRIVATE_KEY,
-            signature_type=0,
+            signature_type=2,
         )
         print("Deriving API credentials...", flush=True)
         try:
             creds = self.clob.derive_api_key()
-            print(f"Derived creds type: {type(creds)}", flush=True)
-            print(f"Derived creds: {creds}", flush=True)
 
             # Handle both dict and object responses
             if isinstance(creds, dict):
@@ -221,14 +220,14 @@ class LiveTrader:
                 key=POLY_PRIVATE_KEY,
                 creds=ApiCreds(api_key, api_secret, api_passphrase),
                 funder=POLY_FUNDER,
-                signature_type=0,
+                signature_type=2,
             )
             print(f"API creds derived OK (key: {api_key[:12]}...)", flush=True)
 
             # Quick auth check
             try:
-                ok = self.clob.get_api_keys()
-                print(f"Auth check: {ok}", flush=True)
+                keys = self.clob.get_api_keys()
+                print(f"Auth check: {keys}", flush=True)
             except Exception as ae:
                 print(f"Auth check failed: {ae}", flush=True)
         except Exception as e:
@@ -240,7 +239,7 @@ class LiveTrader:
                 key=POLY_PRIVATE_KEY,
                 creds=ApiCreds(POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE),
                 funder=POLY_FUNDER,
-                signature_type=0,
+                signature_type=2,
             )
 
     def _log_balance(self):
