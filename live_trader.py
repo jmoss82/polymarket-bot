@@ -414,10 +414,11 @@ class LiveTrader:
             # Place real order
             order_id = await self._place_order(token_id, our_price, self.bet_size)
 
+            # Mark trade taken regardless of success to prevent retry spam
+            iv.trade_taken = True
+
             if not order_id:
                 return
-
-            iv.trade_taken = True
             iv.trade = {
                 "side": signal,
                 "entry_price": our_price,
@@ -451,7 +452,10 @@ class LiveTrader:
         """Place a market buy order. Returns order_id or None."""
         try:
             # Build order — buying YES/NO tokens at limit price
+            # Ensure order value >= $1 (Polymarket minimum)
             size = round(amount / price, 2)
+            if size * price < 1.0:
+                size = round(1.05 / price, 2)  # pad slightly above $1
             order_args = OrderArgs(
                 token_id=token_id,
                 price=price,
@@ -562,7 +566,8 @@ class LiveTrader:
 
     def _apply_audit_overrides(self):
         # Intentionally permissive to guarantee a single live fill quickly.
-        self.bet_size = _env_float("AUDIT_BET_SIZE", 1.0)
+        # Min $5 bet to stay above Polymarket's $1 minimum order value at any price.
+        self.bet_size = _env_float("AUDIT_BET_SIZE", 5.0)
         self.min_move_pct = _env_float("AUDIT_MIN_MOVE_PCT", 0.0)
         self.strong_move_pct = _env_float("AUDIT_STRONG_MOVE_PCT", 0.0)
         self.entry_window = (
