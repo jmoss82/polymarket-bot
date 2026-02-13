@@ -49,8 +49,8 @@ MIN_EDGE = _env_float("MIN_EDGE", 0.02)
 MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 
 # Exit logic
-TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.50)   # sell when position is up +50%
-STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is down -25%
+TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.20)   # sell when position is up +20%
+STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.15)       # sell when position is down -15%
 EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
 MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 5)       # check price every 5 seconds
 
