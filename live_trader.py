@@ -264,6 +264,15 @@ class LiveTrader:
                 print(f"Auth check: {keys}", flush=True)
             except Exception as ae:
                 print(f"Auth check failed: {ae}", flush=True)
+
+            # Set allowances for USDC + Conditional Tokens (required for sells)
+            try:
+                print("Setting token allowances (USDC + Conditional Tokens)...", flush=True)
+                self.clob.set_allowances()
+                print("Token allowances set OK", flush=True)
+            except Exception as ae:
+                print(f"WARNING: set_allowances() failed: {ae}", flush=True)
+                print("Sells may fail — allowances might need to be set via Polymarket UI", flush=True)
         except Exception as e:
             print(f"WARNING: Could not derive creds: {e}", flush=True)
             print("Falling back to env creds...", flush=True)
