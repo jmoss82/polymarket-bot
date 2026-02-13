@@ -536,27 +536,27 @@ class LiveTrader:
             print(f"  [ERR evaluate] {e}")
 
     async def _place_order(self, token_id, price, amount):
-        """Place a FAK market buy order. Returns order_id or None.
+        """Place a FAK limit buy order. Returns order_id or None.
         FAK = Fill-And-Kill: fills as much as possible instantly, cancels the rest.
-        amount = dollar amount to spend; price = ceiling price."""
+        Uses standard OrderArgs (proven to match) posted with FAK type."""
         try:
+            # Build order — buying YES/NO tokens at limit price
             # Ensure order value >= $1 (Polymarket minimum)
-            if amount < 1.0:
-                amount = 1.05
-            order_args = MarketOrderArgs(
+            size = round(amount / price, 2)
+            if size * price < 1.0:
+                size = round(1.05 / price, 2)  # pad slightly above $1
+            order_args = OrderArgs(
                 token_id=token_id,
-                amount=amount,   # dollars to spend
+                price=price,
+                size=size,
                 side="BUY",
-                price=price,     # ceiling price (worst we'll pay)
-                order_type=OrderType.FAK,
             )
-            est_shares = round(amount / price, 2) if price > 0 else 0
-            print(f"  [ORDER] FAK BUY token={token_id[:16]}... ${amount} @ ceiling {price} (~{est_shares} shares)", flush=True)
+            print(f"  [ORDER] FAK BUY token={token_id[:16]}... price={price} size={size} (~${size * price:.2f})", flush=True)
 
-            # Two-step: create signed order, then post with FAK type
+            # Two-step: create standard order, then post with FAK for instant execution
             loop = asyncio.get_event_loop()
             signed_order = await loop.run_in_executor(
-                None, lambda: self.clob.create_market_order(order_args)
+                None, lambda: self.clob.create_order(order_args)
             )
             result = await loop.run_in_executor(
                 None, lambda: self.clob.post_order(signed_order, OrderType.FAK)
@@ -823,25 +823,24 @@ class LiveTrader:
             return
 
         try:
-            # FOK market sell: amount = shares to sell, price = floor price
-            order_args = MarketOrderArgs(
+            # Standard limit sell posted with FAK for instant execution
+            order_args = OrderArgs(
                 token_id=token_id,
-                amount=shares,       # shares to sell
+                price=floor_price,
+                size=shares,
                 side="SELL",
-                price=floor_price,   # worst price we'll accept
-                order_type=OrderType.FAK,
             )
-            print(f"  [SELL] FAK token={token_id[:16]}... shares={shares} floor={floor_price} reason={reason}", flush=True)
+            print(f"  [SELL] FAK token={token_id[:16]}... price={floor_price} size={shares} reason={reason}", flush=True)
 
             loop = asyncio.get_event_loop()
             signed_order = await loop.run_in_executor(
-                None, lambda: self.clob.create_market_order(order_args)
+                None, lambda: self.clob.create_order(order_args)
             )
             result = await loop.run_in_executor(
                 None, lambda: self.clob.post_order(signed_order, OrderType.FAK)
             )
 
-            # Parse FOK response
+            # Parse FAK response
             error_msg = ""
             order_id = None
             if isinstance(result, dict):
