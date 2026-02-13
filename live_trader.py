@@ -536,8 +536,8 @@ class LiveTrader:
             print(f"  [ERR evaluate] {e}")
 
     async def _place_order(self, token_id, price, amount):
-        """Place a FOK market buy order. Returns order_id or None.
-        FOK = Fill-Or-Kill: fills the entire order instantly or cancels it.
+        """Place a FAK market buy order. Returns order_id or None.
+        FAK = Fill-And-Kill: fills as much as possible instantly, cancels the rest.
         amount = dollar amount to spend; price = ceiling price."""
         try:
             # Ensure order value >= $1 (Polymarket minimum)
@@ -548,25 +548,25 @@ class LiveTrader:
                 amount=amount,   # dollars to spend
                 side="BUY",
                 price=price,     # ceiling price (worst we'll pay)
-                order_type=OrderType.FOK,
+                order_type=OrderType.FAK,
             )
             est_shares = round(amount / price, 2) if price > 0 else 0
-            print(f"  [ORDER] FOK BUY token={token_id[:16]}... ${amount} @ ceiling {price} (~{est_shares} shares)", flush=True)
+            print(f"  [ORDER] FAK BUY token={token_id[:16]}... ${amount} @ ceiling {price} (~{est_shares} shares)", flush=True)
 
-            # Two-step: create signed order, then post with FOK type
+            # Two-step: create signed order, then post with FAK type
             loop = asyncio.get_event_loop()
             signed_order = await loop.run_in_executor(
                 None, lambda: self.clob.create_market_order(order_args)
             )
             result = await loop.run_in_executor(
-                None, lambda: self.clob.post_order(signed_order, OrderType.FOK)
+                None, lambda: self.clob.post_order(signed_order, OrderType.FAK)
             )
 
             if not result:
                 print(f"  [ORDER] Empty response", flush=True)
                 return None
 
-            # Parse response — FOK either fills or returns an error
+            # Parse response — FAK fills what it can instantly
             error_msg = ""
             order_id = None
             status = ""
@@ -578,7 +578,7 @@ class LiveTrader:
                 order_id = str(result)
 
             if error_msg:
-                print(f"  [ORDER] FOK rejected: {error_msg}", flush=True)
+                print(f"  [ORDER] FAK rejected: {error_msg}", flush=True)
                 log_event("order_error", {"error": error_msg, "token_id": token_id})
                 return None
 
@@ -586,7 +586,7 @@ class LiveTrader:
                 print(f"  [ORDER] No order ID: {result}", flush=True)
                 return None
 
-            print(f"  [ORDER] FOK accepted: status={status} id={order_id[:16]}...", flush=True)
+            print(f"  [ORDER] FAK accepted: status={status} id={order_id[:16]}...", flush=True)
             return order_id
 
         except Exception as e:
@@ -595,9 +595,9 @@ class LiveTrader:
             return None
 
     async def _confirm_fill(self, order_id, max_wait=5.0):
-        """Check fill details for a FOK order (fills are instant).
+        """Check fill details for a FAK/FOK market order (fills are instant).
         Returns (filled_size, avg_price) or (0, 0).
-        FOK orders don't need polling or cancellation — they fill instantly or are killed."""
+        Market orders don't need polling or cancellation — they fill instantly."""
         loop = asyncio.get_event_loop()
 
         # FOK fills are instant — brief pause for API consistency, then check
@@ -829,16 +829,16 @@ class LiveTrader:
                 amount=shares,       # shares to sell
                 side="SELL",
                 price=floor_price,   # worst price we'll accept
-                order_type=OrderType.FOK,
+                order_type=OrderType.FAK,
             )
-            print(f"  [SELL] FOK token={token_id[:16]}... shares={shares} floor={floor_price} reason={reason}", flush=True)
+            print(f"  [SELL] FAK token={token_id[:16]}... shares={shares} floor={floor_price} reason={reason}", flush=True)
 
             loop = asyncio.get_event_loop()
             signed_order = await loop.run_in_executor(
                 None, lambda: self.clob.create_market_order(order_args)
             )
             result = await loop.run_in_executor(
-                None, lambda: self.clob.post_order(signed_order, OrderType.FOK)
+                None, lambda: self.clob.post_order(signed_order, OrderType.FAK)
             )
 
             # Parse FOK response
