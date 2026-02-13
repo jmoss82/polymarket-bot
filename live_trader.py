@@ -483,9 +483,9 @@ class LiveTrader:
                 })
                 return
 
-            # Buy 1 cent above the best ask to guarantee crossing the spread
-            buy_price = round(min(best_ask + 0.01, 0.99), 2)
-            print(f"  [BOOK] bid {best_bid:.3f} / ask {best_ask:.3f} | spread {spread:.3f} | depth ${bid_depth:.0f}/${ask_depth:.0f}", flush=True)
+            # Price at exact best ask — FAK needs to match resting orders precisely
+            buy_price = round(min(best_ask, 0.99), 2)
+            print(f"  [BOOK] token={token_id[:16]}... bid {best_bid:.3f} / ask {best_ask:.3f} | spread {spread:.3f} | depth ${bid_depth:.0f}/${ask_depth:.0f}", flush=True)
             order_id = await self._place_order(token_id, buy_price, self.bet_size)
 
             # Mark trade taken regardless of success to prevent retry spam
