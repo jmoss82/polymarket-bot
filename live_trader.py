@@ -56,6 +56,7 @@ MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 10)      # check price every 10 
 
 # Risk management
 MAX_SESSION_LOSS = _env_float("MAX_SESSION_LOSS", 15.0)  # stop trading after $15 cumulative loss
+MAX_SPREAD = _env_float("MAX_SPREAD", 0.06)              # skip entry if spread > 6 cents
 
 DATA_DIR = "data"
 TRADES_FILE = os.path.join(DATA_DIR, "live_trades.json")
@@ -212,6 +213,7 @@ class LiveTrader:
         self.exit_before_end = EXIT_BEFORE_END
         self.monitor_interval = MONITOR_INTERVAL
         self.max_session_loss = MAX_SESSION_LOSS
+        self.max_spread = MAX_SPREAD
         self.session_pnl = 0.0          # tracks cumulative P&L this session
         self._circuit_breaker = False    # set True when max loss hit
 
@@ -414,11 +416,34 @@ class LiveTrader:
             if len(prices) < 2 or len(clob_ids) < 2:
                 return
 
-            price_up, price_down = float(prices[0]), float(prices[1])
-            our_price = price_up if signal == "Up" else price_down
             token_id = clob_ids[0] if signal == "Up" else clob_ids[1]
             accepting = market.get("acceptingOrders")
             min_size = market.get("orderMinSize")
+
+            if accepting is False:
+                log_event("signal_skip", {
+                    "slug": iv.slug, "signal": signal, "strength": strength,
+                    "reason": "acceptingOrders=false",
+                })
+                return
+
+            # Fetch live orderbook from CLOB (not stale Gamma prices)
+            best_bid, best_ask, bid_depth, ask_depth, spread = await self._get_order_book(token_id)
+            if best_ask is None or best_bid is None:
+                print(f"  [SKIP] No orderbook data for {signal}", flush=True)
+                return
+
+            our_price = best_ask  # what we'd actually pay to buy
+
+            # Spread filter — skip if spread is too wide (eating our edge)
+            if spread > self.max_spread:
+                print(f"  [SKIP] Spread {spread:.3f} > max {self.max_spread:.3f} | bid {best_bid:.3f} / ask {best_ask:.3f}", flush=True)
+                log_event("signal_skip", {
+                    "slug": iv.slug, "signal": signal, "strength": strength,
+                    "spread": spread, "best_bid": best_bid, "best_ask": best_ask,
+                    "reason": "spread_too_wide",
+                })
+                return
 
             if strength == "STRONG":
                 fair = 0.80 if iv.elapsed > 600 else 0.70
@@ -431,8 +456,11 @@ class LiveTrader:
                 "slug": iv.slug,
                 "signal": signal,
                 "strength": strength,
-                "price_up": price_up,
-                "price_down": price_down,
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": spread,
+                "bid_depth": round(bid_depth, 2),
+                "ask_depth": round(ask_depth, 2),
                 "our_price": our_price,
                 "edge": edge,
                 "accepting_orders": accepting,
@@ -440,21 +468,16 @@ class LiveTrader:
             })
 
             if our_price > self.max_entry_price or edge < self.min_edge:
-                log_event("signal_skip", {
-                    "slug": iv.slug, "signal": signal, "strength": strength,
-                    "our_price": our_price, "edge": edge, "move": iv.move_pct
-                })
-                return
-            if accepting is False:
+                print(f"  [SKIP] ask {best_ask:.3f} | edge {edge:+.3f} (need {self.min_edge}) | spread {spread:.3f}", flush=True)
                 log_event("signal_skip", {
                     "slug": iv.slug, "signal": signal, "strength": strength,
                     "our_price": our_price, "edge": edge, "move": iv.move_pct,
-                    "reason": "acceptingOrders=false",
                 })
                 return
 
-            # Place real order — price 2 cents above market to cross the spread and fill immediately
-            buy_price = round(min(our_price + 0.02, 0.99), 2)
+            # Buy 1 cent above the best ask to guarantee crossing the spread
+            buy_price = round(min(best_ask + 0.01, 0.99), 2)
+            print(f"  [BOOK] bid {best_bid:.3f} / ask {best_ask:.3f} | spread {spread:.3f} | depth ${bid_depth:.0f}/${ask_depth:.0f}", flush=True)
             order_id = await self._place_order(token_id, buy_price, self.bet_size)
 
             # Mark trade taken regardless of success to prevent retry spam
@@ -619,6 +642,52 @@ class LiveTrader:
                 pass
 
         return 0, 0
+
+    async def _get_order_book(self, token_id):
+        """Get full orderbook from CLOB. Returns (best_bid, best_ask, bid_depth, ask_depth, spread) or Nones."""
+        loop = asyncio.get_event_loop()
+        try:
+            book = await loop.run_in_executor(
+                None, lambda: self.clob.get_order_book(token_id)
+            )
+
+            if not book:
+                return None, None, None, None, None
+
+            # Parse bids and asks — handle both dict and object
+            if isinstance(book, dict):
+                bids = book.get("bids", [])
+                asks = book.get("asks", [])
+            else:
+                bids = getattr(book, "bids", []) or []
+                asks = getattr(book, "asks", []) or []
+
+            # Best bid = highest bid, best ask = lowest ask
+            best_bid = 0
+            bid_depth = 0
+            for b in bids:
+                p = float(b.get("price", 0) if isinstance(b, dict) else getattr(b, "price", 0))
+                s = float(b.get("size", 0) if isinstance(b, dict) else getattr(b, "size", 0))
+                if p > best_bid:
+                    best_bid = p
+                bid_depth += p * s  # dollar depth
+
+            best_ask = 1.0
+            ask_depth = 0
+            for a in asks:
+                p = float(a.get("price", 0) if isinstance(a, dict) else getattr(a, "price", 0))
+                s = float(a.get("size", 0) if isinstance(a, dict) else getattr(a, "size", 0))
+                if p < best_ask:
+                    best_ask = p
+                ask_depth += p * s
+
+            spread = round(best_ask - best_bid, 4) if best_ask > best_bid else 0
+
+            return best_bid, best_ask, bid_depth, ask_depth, spread
+
+        except Exception as e:
+            print(f"  [BOOK ERR] {e}", flush=True)
+            return None, None, None, None, None
 
     async def _get_clob_midpoint(self, token_id):
         """Get live midpoint price from CLOB orderbook (not cached Gamma API)."""
@@ -898,7 +967,7 @@ class LiveTrader:
         print(f"Bet: ${self.bet_size} | Min move: {self.min_move_pct}% | Window: {self.entry_window[0]}-{self.entry_window[1]}s")
         print(f"Edge: >= {self.min_edge} | Max price: {self.max_entry_price}")
         print(f"Exit: TP {self.take_profit_pct:+.0%} / SL {-self.stop_loss_pct:+.0%} / Forced @ {self.exit_before_end}s before end | Monitor every {self.monitor_interval}s")
-        print(f"Risk: Max session loss ${self.max_session_loss:.0f}")
+        print(f"Risk: Max session loss ${self.max_session_loss:.0f} | Max spread: {self.max_spread:.2f}")
         print(f"Logs: {TRADES_CSV}")
         print(f"*** REAL MONEY MODE ***")
         if not self._log_and_check_funder():
