@@ -399,6 +399,12 @@ class LiveTrader:
                     print(f"  [SIGNAL] {abs_move:.3f}% @ {iv.elapsed:.0f}s — below threshold", flush=True)
             return
 
+        # Throttle evaluations to once per minute (avoid hammering CLOB API)
+        minute = int(iv.elapsed) // 60
+        if minute == iv.last_signal_minute:
+            return
+        iv.last_signal_minute = minute
+
         signal = "Up" if iv.move_pct > 0 else "Down"
         await self._evaluate(iv, signal, strength, price)
 
