@@ -42,17 +42,17 @@ BET_SIZE = _env_float("BET_SIZE", 5.0)           # dollars per trade — start s
 MIN_MOVE_PCT = _env_float("MIN_MOVE_PCT", 0.05)  # TEMP: lowered from 0.10 to test order execution
 STRONG_MOVE_PCT = _env_float("STRONG_MOVE_PCT", 0.10)   # TEMP: lowered from 0.15
 ENTRY_WINDOW = (
-    _env_int("ENTRY_START", 120),
+    _env_int("ENTRY_START", 45),
     _env_int("ENTRY_END", 840),
 )
-MIN_EDGE = _env_float("MIN_EDGE", 0.05)
+MIN_EDGE = _env_float("MIN_EDGE", 0.02)
 MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 
 # Exit logic
 TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.50)   # sell when position is up +50%
 STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is down -25%
 EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
-MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 10)      # check price every 10 seconds
+MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 5)       # check price every 5 seconds
 
 # Risk management
 MAX_SESSION_LOSS = _env_float("MAX_SESSION_LOSS", 15.0)  # stop trading after $15 cumulative loss
@@ -399,11 +399,11 @@ class LiveTrader:
                     print(f"  [SIGNAL] {abs_move:.3f}% @ {iv.elapsed:.0f}s — below threshold", flush=True)
             return
 
-        # Throttle evaluations to once per minute (avoid hammering CLOB API)
-        minute = int(iv.elapsed) // 60
-        if minute == iv.last_signal_minute:
+        # Throttle evaluations to once per 30 seconds (balance API load vs responsiveness)
+        half_min = int(iv.elapsed) // 30
+        if half_min == iv.last_signal_minute:
             return
-        iv.last_signal_minute = minute
+        iv.last_signal_minute = half_min
 
         signal = "Up" if iv.move_pct > 0 else "Down"
         await self._evaluate(iv, signal, strength, price)
@@ -452,9 +452,9 @@ class LiveTrader:
                 return
 
             if strength == "STRONG":
-                fair = 0.80 if iv.elapsed > 600 else 0.70
+                fair = 0.85 if iv.elapsed > 600 else 0.75
             else:
-                fair = 0.65
+                fair = 0.70
 
             edge = fair - our_price
 
