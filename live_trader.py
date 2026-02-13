@@ -541,8 +541,17 @@ class LiveTrader:
         Uses standard OrderArgs (proven to match) posted with FAK type."""
         try:
             # Build order — buying YES/NO tokens at limit price
-            # Ensure order value >= $1 (Polymarket minimum)
-            size = round(amount / price, 2)
+            # FAK requires USDC cost (size * price) to have max 2 decimal places.
+            # Use integer math to find the largest valid size.
+            price_cents = int(round(price * 100))
+            raw_size_cents = int(amount * 100 * 100 // price_cents)  # floor(amount/price * 100)
+
+            # Decrease until (size_cents * price_cents) % 100 == 0 → cost has 2dp
+            size_cents = raw_size_cents
+            while size_cents > 100 and (size_cents * price_cents) % 100 != 0:
+                size_cents -= 1
+
+            size = size_cents / 100.0
             if size * price < 1.0:
                 size = round(1.05 / price, 2)  # pad slightly above $1
             order_args = OrderArgs(
