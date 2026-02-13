@@ -168,6 +168,7 @@ class IntervalState:
         self.exit_pnl = None
         self.last_monitor_ts = 0     # throttle Polymarket price checks
         self.sell_attempts = 0       # cap retries on failed sells
+        self.sell_in_progress = False  # prevents concurrent sell attempts
 
     @property
     def elapsed(self):
@@ -730,6 +731,10 @@ class LiveTrader:
         """Check current market price via CLOB orderbook and decide whether to exit."""
         now = time.time()
 
+        # Skip if a sell is already in flight (prevents concurrent sell orders)
+        if iv.sell_in_progress:
+            return
+
         # Forced exit — sell no matter what with EXIT_BEFORE_END seconds remaining
         if iv.remaining <= self.exit_before_end:
             print(f"  [EXIT] Forced exit — {iv.remaining:.0f}s left before resolution", flush=True)
@@ -775,126 +780,130 @@ class LiveTrader:
     async def _sell_position(self, iv, reason="manual", sell_price=None):
         """Sell the current position using an aggressive GTC limit order on the CLOB."""
         MAX_SELL_ATTEMPTS = 3
-        iv.sell_attempts += 1
-        if iv.sell_attempts > MAX_SELL_ATTEMPTS:
-            print(f"  [SELL GAVE UP] {iv.sell_attempts - 1} failed attempts — marking exited", flush=True)
-            iv.exited = True
-            iv.exit_reason = f"{reason}_failed"
-            iv.exit_pnl = 0  # unknown, couldn't sell
-            log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} attempts"})
-            return
-
-        trade = iv.trade
-        token_id = trade["token_id"]
-        shares = round(trade["shares"], 2)  # actual filled shares — never exceed this
-
-        # Get current bid price for PnL estimation and floor price
-        if sell_price is None:
-            try:
-                sell_price = await self._get_clob_price(token_id, side="SELL")
-                if sell_price and sell_price > 0:
-                    print(f"  [SELL] CLOB bid price: {sell_price:.3f}", flush=True)
-                else:
-                    sell_price = None
-            except Exception as e:
-                print(f"  [SELL] CLOB price fetch failed: {e}", flush=True)
-                sell_price = None
-
-        if sell_price is None:
-            # Last resort: sell at a discount to guarantee fill
-            sell_price = max(trade["entry_price"] * 0.5, 0.01)
-            print(f"  [WARN] Could not fetch sell price, using {sell_price:.3f}", flush=True)
-
-        # Floor price for sell — worst price we'll accept
-        floor_price = round(max(sell_price - 0.02, 0.01), 2)
-
-        # Check if sell meets $1 minimum — NEVER inflate shares beyond what we own
-        order_value = shares * floor_price
-        if order_value < 1.0:
-            print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — cannot sell", flush=True)
-            log_event("sell_error", {"reason": reason, "error": f"below $1 min: {shares} shares @ {floor_price}"})
-            # On forced exit, mark as exited anyway to avoid infinite retries
-            if reason == "forced_exit":
-                iv.exited = True
-                iv.exit_reason = "forced_exit_below_min"
-                iv.exit_pnl = 0
-            return
-
+        iv.sell_in_progress = True
         try:
-            # Aggressive GTC limit sell. If not filled by timeout, cancel and retry.
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=floor_price,
-                size=shares,
-                side="SELL",
-            )
-            print(f"  [SELL] GTC token={token_id[:16]}... price={floor_price} size={shares} reason={reason}", flush=True)
-
-            loop = asyncio.get_event_loop()
-            signed_order = await loop.run_in_executor(
-                None, lambda: self.clob.create_order(order_args)
-            )
-            result = await loop.run_in_executor(
-                None, lambda: self.clob.post_order(signed_order, OrderType.GTC)
-            )
-
-            # Parse response
-            error_msg = ""
-            order_id = None
-            if isinstance(result, dict):
-                error_msg = result.get("errorMsg", "")
-                order_id = result.get("orderID", "")
-            else:
-                order_id = str(result) if result else None
-
-            if error_msg:
-                print(f"  [SELL GTC REJECTED] {error_msg}", flush=True)
-                log_event("sell_error", {"error": error_msg, "reason": reason})
+            iv.sell_attempts += 1
+            if iv.sell_attempts > MAX_SELL_ATTEMPTS:
+                print(f"  [SELL GAVE UP] {iv.sell_attempts - 1} failed attempts — marking exited", flush=True)
+                iv.exited = True
+                iv.exit_reason = f"{reason}_failed"
+                iv.exit_pnl = 0  # unknown, couldn't sell
+                log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} attempts"})
                 return
 
-            if order_id:
-                # Confirm fill details; timeout cancels stale order automatically.
-                filled_size, fill_price = await self._confirm_fill(order_id, max_wait=self.exit_order_timeout)
-                if filled_size <= 0:
-                    print(f"  [SELL UNFILLED] {order_id[:16]}... after {self.exit_order_timeout:.0f}s", flush=True)
-                    log_event("sell_error", {"reason": reason, "error": "unfilled_timeout", "order_id": order_id})
+            trade = iv.trade
+            token_id = trade["token_id"]
+            shares = round(trade["shares"], 2)  # actual filled shares — never exceed this
+
+            # Get current bid price for PnL estimation and floor price
+            if sell_price is None:
+                try:
+                    sell_price = await self._get_clob_price(token_id, side="SELL")
+                    if sell_price and sell_price > 0:
+                        print(f"  [SELL] CLOB bid price: {sell_price:.3f}", flush=True)
+                    else:
+                        sell_price = None
+                except Exception as e:
+                    print(f"  [SELL] CLOB price fetch failed: {e}", flush=True)
+                    sell_price = None
+
+            if sell_price is None:
+                # Last resort: sell at a discount to guarantee fill
+                sell_price = max(trade["entry_price"] * 0.5, 0.01)
+                print(f"  [WARN] Could not fetch sell price, using {sell_price:.3f}", flush=True)
+
+            # Floor price for sell — worst price we'll accept
+            floor_price = round(max(sell_price - 0.02, 0.01), 2)
+
+            # Check if sell meets $1 minimum — NEVER inflate shares beyond what we own
+            order_value = shares * floor_price
+            if order_value < 1.0:
+                print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — cannot sell", flush=True)
+                log_event("sell_error", {"reason": reason, "error": f"below $1 min: {shares} shares @ {floor_price}"})
+                # On forced exit, mark as exited anyway to avoid infinite retries
+                if reason == "forced_exit":
+                    iv.exited = True
+                    iv.exit_reason = "forced_exit_below_min"
+                    iv.exit_pnl = 0
+                return
+
+            try:
+                # Aggressive GTC limit sell. If not filled by timeout, cancel and retry.
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=floor_price,
+                    size=shares,
+                    side="SELL",
+                )
+                print(f"  [SELL] GTC token={token_id[:16]}... price={floor_price} size={shares} reason={reason}", flush=True)
+
+                loop = asyncio.get_event_loop()
+                signed_order = await loop.run_in_executor(
+                    None, lambda: self.clob.create_order(order_args)
+                )
+                result = await loop.run_in_executor(
+                    None, lambda: self.clob.post_order(signed_order, OrderType.GTC)
+                )
+
+                # Parse response
+                error_msg = ""
+                order_id = None
+                if isinstance(result, dict):
+                    error_msg = result.get("errorMsg", "")
+                    order_id = result.get("orderID", "")
+                else:
+                    order_id = str(result) if result else None
+
+                if error_msg:
+                    print(f"  [SELL GTC REJECTED] {error_msg}", flush=True)
+                    log_event("sell_error", {"error": error_msg, "reason": reason})
                     return
-                exit_price = fill_price if fill_price > 0 else sell_price
 
-                pnl_est = (exit_price - trade["entry_price"]) * trade["shares"]
-                iv.exited = True
-                iv.exit_reason = reason
-                iv.exit_price = exit_price
-                iv.exit_pnl = round(pnl_est, 2)
+                if order_id:
+                    # Confirm fill details; timeout cancels stale order automatically.
+                    filled_size, fill_price = await self._confirm_fill(order_id, max_wait=self.exit_order_timeout)
+                    if filled_size <= 0:
+                        print(f"  [SELL UNFILLED] {order_id[:16]}... after {self.exit_order_timeout:.0f}s", flush=True)
+                        log_event("sell_error", {"reason": reason, "error": "unfilled_timeout", "order_id": order_id})
+                        return
+                    exit_price = fill_price if fill_price > 0 else sell_price
 
-                # Credit the sale proceeds back
-                proceeds = exit_price * trade["shares"]
-                self.bankroll += round(proceeds, 2)
+                    pnl_est = (exit_price - trade["entry_price"]) * trade["shares"]
+                    iv.exited = True
+                    iv.exit_reason = reason
+                    iv.exit_price = exit_price
+                    iv.exit_pnl = round(pnl_est, 2)
 
-                trade["exit_price"] = exit_price
-                trade["exit_reason"] = reason
-                trade["exit_order_id"] = order_id
-                trade["exit_ts"] = time.time()
-                trade["exit_pnl"] = iv.exit_pnl
+                    # Credit the sale proceeds back
+                    proceeds = exit_price * trade["shares"]
+                    self.bankroll += round(proceeds, 2)
 
-                save_state(self.trades, self.bankroll)
+                    trade["exit_price"] = exit_price
+                    trade["exit_reason"] = reason
+                    trade["exit_order_id"] = order_id
+                    trade["exit_ts"] = time.time()
+                    trade["exit_pnl"] = iv.exit_pnl
 
-                print(f"  >> SOLD ({reason}) @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | order {order_id[:16]}...", flush=True)
-                log_event("exit", {
-                    "slug": iv.slug, "reason": reason,
-                    "entry_price": trade["entry_price"],
-                    "exit_price": exit_price,
-                    "pnl": iv.exit_pnl,
-                    "bankroll": self.bankroll,
-                    "order_id": order_id,
-                })
-            else:
-                print(f"  [SELL FAILED] No order ID returned for {reason}", flush=True)
-                log_event("sell_error", {"reason": reason, "error": "no order_id"})
+                    save_state(self.trades, self.bankroll)
 
-        except Exception as e:
-            log_event("sell_error", {"error": str(e), "reason": reason})
-            print(f"  [SELL ERROR] {e}", flush=True)
+                    print(f"  >> SOLD ({reason}) @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | order {order_id[:16]}...", flush=True)
+                    log_event("exit", {
+                        "slug": iv.slug, "reason": reason,
+                        "entry_price": trade["entry_price"],
+                        "exit_price": exit_price,
+                        "pnl": iv.exit_pnl,
+                        "bankroll": self.bankroll,
+                        "order_id": order_id,
+                    })
+                else:
+                    print(f"  [SELL FAILED] No order ID returned for {reason}", flush=True)
+                    log_event("sell_error", {"reason": reason, "error": "no order_id"})
+
+            except Exception as e:
+                log_event("sell_error", {"error": str(e), "reason": reason})
+                print(f"  [SELL ERROR] {e}", flush=True)
+        finally:
+            iv.sell_in_progress = False
 
     async def _resolve(self, iv):
         """Resolve a completed interval's trade.
