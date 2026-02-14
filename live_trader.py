@@ -302,15 +302,18 @@ class LiveTrader:
         This is a server-side cache refresh — NOT an on-chain transaction.
         On-chain approvals (setApprovalForAll) must be set once via
         set_allowances.py or the Polymarket UI.
+
+        NOTE: Only USDC (ERC20 / COLLATERAL) is refreshed at startup.
+        Conditional Tokens (ERC1155) require a valid token_id, which we
+        don't have until we discover a market.  The per-sell refresh in
+        _sell_position handles that with the actual token_id.
         """
-        for asset_label, asset_type in [("USDC", AssetType.COLLATERAL),
-                                         ("Conditional Tokens", AssetType.CONDITIONAL)]:
-            try:
-                params = BalanceAllowanceParams(asset_type=asset_type)
-                result = self.clob.update_balance_allowance(params)
-                print(f"  Allowance refresh ({asset_label}): {result}", flush=True)
-            except Exception as e:
-                print(f"  Allowance refresh ({asset_label}) failed: {e}", flush=True)
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
+            result = self.clob.update_balance_allowance(params)
+            print(f"  Allowance refresh (USDC): {result}", flush=True)
+        except Exception as e:
+            print(f"  Allowance refresh (USDC) failed: {e}", flush=True)
 
     def _log_balance(self):
         try:
@@ -322,14 +325,9 @@ class LiveTrader:
             print(f"Balance check failed: {e}", flush=True)
             log_event("error", {"context": "balance", "error": str(e)})
 
-        # Also check conditional token allowance — this is what enables sells
-        try:
-            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL)
-            bal = self.clob.get_balance_allowance(params)
-            print(f"Conditional token allowance: {bal}", flush=True)
-            log_event("conditional_allowance", {"balance": bal})
-        except Exception as e:
-            print(f"Conditional token allowance check failed: {e}", flush=True)
+        # NOTE: Conditional token balance/allowance requires a specific token_id
+        # (ERC1155). We can't check it at startup without a market — the per-sell
+        # refresh in _sell_position handles this with the actual token_id.
 
     def _log_and_check_funder(self):
         """Log wallet addresses and verify POLY_FUNDER is set."""

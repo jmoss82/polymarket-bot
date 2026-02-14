@@ -38,7 +38,7 @@ class ChainlinkFeed:
 
     async def start(self):
         self._running = True
-        print(f"[ChainlinkFeed] Connecting to {RTDS_URL}")
+        print(f"[ChainlinkFeed] Connecting to {RTDS_URL}", flush=True)
 
         while self._running:
             try:
@@ -51,14 +51,19 @@ class ChainlinkFeed:
                     max_size=2**20,
                 ) as ws:
                     if self._connect_count > 1:
-                        print(f"[ChainlinkFeed] Reconnected (attempt #{self._connect_count})")
+                        print(f"[ChainlinkFeed] Reconnected (attempt #{self._connect_count})", flush=True)
                     else:
-                        print("[ChainlinkFeed] Connected")
+                        print("[ChainlinkFeed] Connected", flush=True)
 
                     # Subscribe to Chainlink price feed
                     chainlink_syms = [CHAINLINK_SYMBOLS[s] for s in self.symbols
                                       if s in CHAINLINK_SYMBOLS]
-                    filters = ",".join(chainlink_syms) if chainlink_syms else ""
+
+                    # Build filter — use compact JSON (no spaces) to match docs exactly
+                    if len(chainlink_syms) == 1:
+                        filters = json.dumps({"symbol": chainlink_syms[0]}, separators=(',', ':'))
+                    else:
+                        filters = ""
 
                     sub_msg = {
                         "action": "subscribe",
@@ -66,20 +71,40 @@ class ChainlinkFeed:
                             {
                                 "topic": "crypto_prices_chainlink",
                                 "type": "*",
-                                "filters": json.dumps({"symbol": chainlink_syms[0]}) if len(chainlink_syms) == 1 else "",
+                                "filters": filters,
                             }
                         ],
                     }
-                    await ws.send(json.dumps(sub_msg))
-                    print(f"[ChainlinkFeed] Subscribed: {chainlink_syms}", flush=True)
+                    raw_sub = json.dumps(sub_msg, separators=(',', ':'))
+                    await ws.send(raw_sub)
+                    print(f"[ChainlinkFeed] Subscribed: {chainlink_syms} (filter: {filters})", flush=True)
+
+                    msg_count = 0
+                    last_heartbeat = time.time()
 
                     async for msg in ws:
                         if not self._running:
                             break
+
+                        msg_count += 1
+
+                        # Periodic heartbeat log so we know messages are flowing
+                        now = time.time()
+                        if now - last_heartbeat >= 60:
+                            print(f"[ChainlinkFeed] Heartbeat: {msg_count} msgs, {self._trade_count} prices", flush=True)
+                            last_heartbeat = now
+
                         try:
                             data = json.loads(msg)
 
                             topic = data.get("topic", "")
+
+                            # Log first few messages for diagnostics
+                            if msg_count <= 3:
+                                # Truncate to avoid flooding logs
+                                preview = json.dumps(data)[:300]
+                                print(f"[ChainlinkFeed] msg #{msg_count}: {preview}", flush=True)
+
                             if topic != "crypto_prices_chainlink":
                                 continue
 
@@ -115,18 +140,25 @@ class ChainlinkFeed:
                             }
                             self._trade_count += 1
 
+                            # Log first price received
+                            if self._trade_count == 1:
+                                print(f"[ChainlinkFeed] First price: {symbol} ${price:,.2f}", flush=True)
+
                             if self.on_trade:
                                 await self.on_trade(symbol, price, exchange_ts, local_ts)
 
                         except Exception as e:
-                            print(f"[ChainlinkFeed] Parse error: {e}")
+                            print(f"[ChainlinkFeed] Parse error: {e}", flush=True)
+
+                    # If we get here, the async for loop ended (connection closed)
+                    print(f"[ChainlinkFeed] Connection closed after {msg_count} messages", flush=True)
 
             except asyncio.CancelledError:
-                print("[ChainlinkFeed] Cancelled")
+                print("[ChainlinkFeed] Cancelled", flush=True)
                 break
             except Exception as e:
                 if self._running:
-                    print(f"[ChainlinkFeed] Disconnected: {e}. Reconnecting in 3s...")
+                    print(f"[ChainlinkFeed] Disconnected: {e}. Reconnecting in 3s...", flush=True)
                     await asyncio.sleep(3)
 
     def stop(self):
