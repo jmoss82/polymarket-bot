@@ -15,6 +15,7 @@ import time
 import traceback
 from datetime import datetime, timezone, timedelta
 from binance_ws import BinanceFeed
+from chainlink_ws import ChainlinkFeed
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from config import (
@@ -49,8 +50,8 @@ MIN_EDGE = _env_float("MIN_EDGE", 0.02)
 MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 
 # Exit logic
-TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.20)   # sell when position is up +20%
-STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.15)       # sell when position is down -15%
+TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.50)   # sell when position is up +50%
+STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is down -25%
 EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
 MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 5)       # check price every 5 seconds
 
@@ -160,7 +161,8 @@ class IntervalState:
         self.low_price = None
         self.trade_taken = False
         self.trade = None
-        self.last_signal_minute = -1
+        self.last_log_minute = -1       # throttle below-threshold signal logging (per minute)
+        self.last_eval_half_min = -1    # throttle entry evaluations (per 30s)
         # Exit tracking
         self.exited = False
         self.exit_reason = None      # "take_profit", "stop_loss", "forced_exit"
@@ -168,7 +170,6 @@ class IntervalState:
         self.exit_pnl = None
         self.last_monitor_ts = 0     # throttle Polymarket price checks
         self.sell_attempts = 0       # cap retries on failed sells
-        self.sell_in_progress = False  # prevents concurrent sell attempts
 
     @property
     def elapsed(self):
@@ -195,7 +196,16 @@ class LiveTrader:
         ensure_dirs()
         self.trades, self.bankroll = load_state()
         self.current_interval = None
-        self.feed = BinanceFeed(symbols=["BTC"], on_trade=self._on_trade)
+        # Price feed: Chainlink (via Polymarket RTDS) is the default because
+        # it's the same oracle Polymarket uses to resolve BTC 15-min markets.
+        # Set PRICE_FEED=binance to fall back to Binance if needed.
+        feed_choice = os.getenv("PRICE_FEED", "chainlink").lower()
+        if feed_choice == "binance":
+            self.feed = BinanceFeed(symbols=["BTC"], on_trade=self._on_trade)
+            self._feed_name = "Binance"
+        else:
+            self.feed = ChainlinkFeed(symbols=["BTC"], on_trade=self._on_trade)
+            self._feed_name = "Chainlink"
         self._http = None
         self._last_status_bucket = 0
         self._pending_resolve = None
@@ -265,14 +275,10 @@ class LiveTrader:
             except Exception as ae:
                 print(f"Auth check failed: {ae}", flush=True)
 
-            # Set allowances for USDC + Conditional Tokens (required for sells)
-            try:
-                print("Setting token allowances (USDC + Conditional Tokens)...", flush=True)
-                self.clob.set_allowances()
-                print("Token allowances set OK", flush=True)
-            except Exception as ae:
-                print(f"WARNING: set_allowances() failed: {ae}", flush=True)
-                print("Sells may fail — allowances might need to be set via Polymarket UI", flush=True)
+            # Refresh CLOB allowance cache for both USDC (buys) and Conditional Tokens (sells).
+            # This does NOT set on-chain approvals — run set_allowances.py for that.
+            # It tells the CLOB server to re-read on-chain state so it knows we have approval.
+            self._refresh_allowances()
         except Exception as e:
             print(f"WARNING: Could not derive creds: {e}", flush=True)
             print("Falling back to env creds...", flush=True)
@@ -285,6 +291,27 @@ class LiveTrader:
                 signature_type=2,
             )
 
+    def _refresh_allowances(self):
+        """Tell the CLOB server to refresh its cached view of on-chain allowances.
+
+        Polymarket's CLOB caches your on-chain token approvals.  After a buy,
+        the conditional-token balance changes, but the server may not see it
+        until we explicitly ask it to refresh.  Without this, sell orders fail
+        with 'not enough balance / allowance'.
+
+        This is a server-side cache refresh — NOT an on-chain transaction.
+        On-chain approvals (setApprovalForAll) must be set once via
+        set_allowances.py or the Polymarket UI.
+        """
+        for asset_label, asset_type in [("USDC", AssetType.COLLATERAL),
+                                         ("Conditional Tokens", AssetType.CONDITIONAL)]:
+            try:
+                params = BalanceAllowanceParams(asset_type=asset_type)
+                result = self.clob.update_balance_allowance(params)
+                print(f"  Allowance refresh ({asset_label}): {result}", flush=True)
+            except Exception as e:
+                print(f"  Allowance refresh ({asset_label}) failed: {e}", flush=True)
+
     def _log_balance(self):
         try:
             params = BalanceAllowanceParams(asset_type=AssetType.COLLATERAL)
@@ -294,6 +321,15 @@ class LiveTrader:
         except Exception as e:
             print(f"Balance check failed: {e}", flush=True)
             log_event("error", {"context": "balance", "error": str(e)})
+
+        # Also check conditional token allowance — this is what enables sells
+        try:
+            params = BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL)
+            bal = self.clob.get_balance_allowance(params)
+            print(f"Conditional token allowance: {bal}", flush=True)
+            log_event("conditional_allowance", {"balance": bal})
+        except Exception as e:
+            print(f"Conditional token allowance check failed: {e}", flush=True)
 
     def _log_and_check_funder(self):
         """Log wallet addresses and verify POLY_FUNDER is set."""
@@ -408,16 +444,16 @@ class LiveTrader:
         else:
             if abs_move > 0.03:
                 minute = int(iv.elapsed) // 60
-                if minute != iv.last_signal_minute:
-                    iv.last_signal_minute = minute
+                if minute != iv.last_log_minute:
+                    iv.last_log_minute = minute
                     print(f"  [SIGNAL] {abs_move:.3f}% @ {iv.elapsed:.0f}s — below threshold", flush=True)
             return
 
         # Throttle evaluations to once per 30 seconds (balance API load vs responsiveness)
         half_min = int(iv.elapsed) // 30
-        if half_min == iv.last_signal_minute:
+        if half_min == iv.last_eval_half_min:
             return
-        iv.last_signal_minute = half_min
+        iv.last_eval_half_min = half_min
 
         signal = "Up" if iv.move_pct > 0 else "Down"
         await self._evaluate(iv, signal, strength, price)
@@ -433,12 +469,23 @@ class LiveTrader:
 
             prices = json.loads(market.get("outcomePrices", "[]"))
             clob_ids = json.loads(market.get("clobTokenIds", "[]"))
-            if len(prices) < 2 or len(clob_ids) < 2:
+            outcomes = json.loads(market.get("outcomes", "[]"))
+            if len(prices) < 2 or len(clob_ids) < 2 or len(outcomes) < 2:
                 return
 
-            price_up = float(prices[0])
-            price_down = float(prices[1])
-            token_id = clob_ids[0] if signal == "Up" else clob_ids[1]
+            # Map outcomes to indices — never assume ordering
+            outcome_map = {}  # {"Up": 0, "Down": 1} or reversed
+            for i, name in enumerate(outcomes):
+                outcome_map[name] = i
+
+            if signal not in outcome_map:
+                print(f"  [SKIP] Signal '{signal}' not in outcomes {outcomes}", flush=True)
+                return
+
+            sig_idx = outcome_map[signal]
+            price_up = float(prices[outcome_map.get("Up", 0)])
+            price_down = float(prices[outcome_map.get("Down", 1)])
+            token_id = clob_ids[sig_idx]
             accepting = market.get("acceptingOrders")
             min_size = market.get("orderMinSize")
 
@@ -455,7 +502,10 @@ class LiveTrader:
                 print(f"  [SKIP] No orderbook data for {signal}", flush=True)
                 return
 
-            our_price = best_ask  # what we'd actually pay to buy
+            # Actual buy price: we place a GTC limit at best_ask + 0.01 to fill aggressively.
+            # Edge must be calculated against THIS price, not bare best_ask.
+            buy_price = round(min(best_ask + 0.01, 0.99), 2)
+            our_price = buy_price
 
             # Spread filter — skip if spread is too wide (eating our edge)
             if spread > self.max_spread:
@@ -497,16 +547,20 @@ class LiveTrader:
                 })
                 return
 
-            # Aggressive GTC limit buy; may fill immediately or within a short timeout window.
-            buy_price = round(min(best_ask + 0.01, 0.99), 2)
+            # buy_price already calculated above (best_ask + 0.01, capped at 0.99)
             print(f"  [BOOK] token={token_id[:16]}... bid {best_bid:.3f} / ask {best_ask:.3f} | spread {spread:.3f} | depth ${bid_depth:.0f}/${ask_depth:.0f}", flush=True)
             order_id = await self._place_order(token_id, buy_price, self.bet_size)
 
-            # Mark trade taken regardless of success to prevent retry spam
-            iv.trade_taken = True
-
             if not order_id:
+                # Order failed at submission (API error, not a fill issue).
+                # Allow retry on the next evaluation cycle instead of locking
+                # out the entire interval — the issue may be transient.
+                log_event("order_error_retry", {"token_id": token_id, "reason": "no_order_id"})
                 return
+
+            # Order was accepted — now we're committed. Mark trade_taken to
+            # prevent duplicate orders while we wait for fill confirmation.
+            iv.trade_taken = True
 
             # Confirm fill — poll order status (don't assume filled just because we got an orderID)
             filled_size, fill_price = await self._confirm_fill(order_id, max_wait=self.entry_order_timeout)
@@ -632,16 +686,26 @@ class LiveTrader:
                     await asyncio.sleep(1.0)
                     continue
 
-                # Handle both dict and object responses
+                # Handle both dict and object responses.
+                # Prefer actual execution price over limit price when available.
                 if isinstance(order, dict):
                     size_matched = float(order.get("size_matched", 0))
                     original_size = float(order.get("original_size", 0))
-                    price = float(order.get("price", 0))
+                    # Try known fields for actual fill price; fall back to limit price
+                    price = float(
+                        order.get("average_matched_price")
+                        or order.get("matched_price")
+                        or order.get("price", 0)
+                    )
                     status = order.get("status", "unknown")
                 else:
                     size_matched = float(getattr(order, "size_matched", 0))
                     original_size = float(getattr(order, "original_size", 0))
-                    price = float(getattr(order, "price", 0))
+                    price = float(
+                        getattr(order, "average_matched_price", None)
+                        or getattr(order, "matched_price", None)
+                        or getattr(order, "price", 0)
+                    )
                     status = getattr(order, "status", "unknown")
 
                 print(f"  [FILL] status={status} filled={size_matched}/{original_size}", flush=True)
@@ -652,8 +716,11 @@ class LiveTrader:
                     print(f"  [FILL] Order {status} — no fill", flush=True)
                     return 0, 0
 
-                # MATCHED can transiently report size_matched=0.
-                if status == "MATCHED" and original_size > 0:
+                # MATCHED with size_matched=0 is likely API lag — poll a few
+                # more times rather than immediately trusting it as a full fill.
+                # This prevents phantom fills that corrupt bankroll tracking.
+                if status == "MATCHED" and size_matched == 0 and attempts >= 5:
+                    print(f"  [FILL] MATCHED but size_matched=0 after {attempts} polls — accepting as filled", flush=True)
                     return original_size, price
 
             except Exception as e:
@@ -740,10 +807,6 @@ class LiveTrader:
         """Check current market price via CLOB orderbook and decide whether to exit."""
         now = time.time()
 
-        # Skip if a sell is already in flight (prevents concurrent sell orders)
-        if iv.sell_in_progress:
-            return
-
         # Forced exit — sell no matter what with EXIT_BEFORE_END seconds remaining
         if iv.remaining <= self.exit_before_end:
             print(f"  [EXIT] Forced exit — {iv.remaining:.0f}s left before resolution", flush=True)
@@ -770,16 +833,16 @@ class LiveTrader:
             # Log position status on each check
             print(f"  [MON] {iv.trade['side']} | entry {entry_price:.3f} -> {current_price:.3f} | P&L {position_pnl_pct:+.1%} | {iv.remaining:.0f}s left", flush=True)
 
-            # Take profit
+            # Take profit — use actual bid for floor price, not midpoint
             if position_pnl_pct >= self.take_profit_pct:
                 print(f"  [EXIT] Take profit: {position_pnl_pct:+.1%} (entry {entry_price:.3f} -> {current_price:.3f})", flush=True)
-                await self._sell_position(iv, reason="take_profit", sell_price=current_price)
+                await self._sell_position(iv, reason="take_profit")
                 return
 
-            # Stop loss
+            # Stop loss — use actual bid for floor price, not midpoint
             if position_pnl_pct <= -self.stop_loss_pct:
                 print(f"  [EXIT] Stop loss: {position_pnl_pct:+.1%} (entry {entry_price:.3f} -> {current_price:.3f})", flush=True)
-                await self._sell_position(iv, reason="stop_loss", sell_price=current_price)
+                await self._sell_position(iv, reason="stop_loss")
                 return
 
         except Exception as e:
@@ -789,130 +852,141 @@ class LiveTrader:
     async def _sell_position(self, iv, reason="manual", sell_price=None):
         """Sell the current position using an aggressive GTC limit order on the CLOB."""
         MAX_SELL_ATTEMPTS = 3
-        iv.sell_in_progress = True
+        iv.sell_attempts += 1
+        if iv.sell_attempts > MAX_SELL_ATTEMPTS:
+            print(f"  [SELL GAVE UP] {iv.sell_attempts - 1} failed attempts — marking exited", flush=True)
+            iv.exited = True
+            iv.exit_reason = f"{reason}_failed"
+            iv.exit_pnl = 0  # unknown, couldn't sell
+            log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} attempts"})
+            return
+
+        trade = iv.trade
+        token_id = trade["token_id"]
+        shares = round(trade["shares"], 2)  # actual filled shares — never exceed this
+
+        # Refresh CLOB's view of our conditional token balance/allowance before selling.
+        # Without this, the CLOB may reject the sell with "not enough balance / allowance"
+        # because its cache doesn't reflect tokens received from a recent buy.
         try:
-            iv.sell_attempts += 1
-            if iv.sell_attempts > MAX_SELL_ATTEMPTS:
-                print(f"  [SELL GAVE UP] {iv.sell_attempts - 1} failed attempts — marking exited", flush=True)
-                iv.exited = True
-                iv.exit_reason = f"{reason}_failed"
-                iv.exit_pnl = 0  # unknown, couldn't sell
-                log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} attempts"})
-                return
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: self.clob.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                )
+            )
+        except Exception as e:
+            print(f"  [SELL] Allowance refresh failed (continuing): {e}", flush=True)
 
-            trade = iv.trade
-            token_id = trade["token_id"]
-            shares = round(trade["shares"], 2)  # actual filled shares — never exceed this
-
-            # Get current bid price for PnL estimation and floor price
-            if sell_price is None:
-                try:
-                    sell_price = await self._get_clob_price(token_id, side="SELL")
-                    if sell_price and sell_price > 0:
-                        print(f"  [SELL] CLOB bid price: {sell_price:.3f}", flush=True)
-                    else:
-                        sell_price = None
-                except Exception as e:
-                    print(f"  [SELL] CLOB price fetch failed: {e}", flush=True)
-                    sell_price = None
-
-            if sell_price is None:
-                # Last resort: sell at a discount to guarantee fill
-                sell_price = max(trade["entry_price"] * 0.5, 0.01)
-                print(f"  [WARN] Could not fetch sell price, using {sell_price:.3f}", flush=True)
-
-            # Floor price for sell — worst price we'll accept
-            floor_price = round(max(sell_price - 0.02, 0.01), 2)
-
-            # Check if sell meets $1 minimum — NEVER inflate shares beyond what we own
-            order_value = shares * floor_price
-            if order_value < 1.0:
-                print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — cannot sell", flush=True)
-                log_event("sell_error", {"reason": reason, "error": f"below $1 min: {shares} shares @ {floor_price}"})
-                # On forced exit, mark as exited anyway to avoid infinite retries
-                if reason == "forced_exit":
-                    iv.exited = True
-                    iv.exit_reason = "forced_exit_below_min"
-                    iv.exit_pnl = 0
-                return
-
+        # Get current bid price for PnL estimation and floor price
+        if sell_price is None:
             try:
-                # Aggressive GTC limit sell. If not filled by timeout, cancel and retry.
-                order_args = OrderArgs(
-                    token_id=token_id,
-                    price=floor_price,
-                    size=shares,
-                    side="SELL",
-                )
-                print(f"  [SELL] GTC token={token_id[:16]}... price={floor_price} size={shares} reason={reason}", flush=True)
-
-                loop = asyncio.get_event_loop()
-                signed_order = await loop.run_in_executor(
-                    None, lambda: self.clob.create_order(order_args)
-                )
-                result = await loop.run_in_executor(
-                    None, lambda: self.clob.post_order(signed_order, OrderType.GTC)
-                )
-
-                # Parse response
-                error_msg = ""
-                order_id = None
-                if isinstance(result, dict):
-                    error_msg = result.get("errorMsg", "")
-                    order_id = result.get("orderID", "")
+                sell_price = await self._get_clob_price(token_id, side="SELL")
+                if sell_price and sell_price > 0:
+                    print(f"  [SELL] CLOB bid price: {sell_price:.3f}", flush=True)
                 else:
-                    order_id = str(result) if result else None
-
-                if error_msg:
-                    print(f"  [SELL GTC REJECTED] {error_msg}", flush=True)
-                    log_event("sell_error", {"error": error_msg, "reason": reason})
-                    return
-
-                if order_id:
-                    # Confirm fill details; timeout cancels stale order automatically.
-                    filled_size, fill_price = await self._confirm_fill(order_id, max_wait=self.exit_order_timeout)
-                    if filled_size <= 0:
-                        print(f"  [SELL UNFILLED] {order_id[:16]}... after {self.exit_order_timeout:.0f}s", flush=True)
-                        log_event("sell_error", {"reason": reason, "error": "unfilled_timeout", "order_id": order_id})
-                        return
-                    exit_price = fill_price if fill_price > 0 else sell_price
-
-                    pnl_est = (exit_price - trade["entry_price"]) * trade["shares"]
-                    iv.exited = True
-                    iv.exit_reason = reason
-                    iv.exit_price = exit_price
-                    iv.exit_pnl = round(pnl_est, 2)
-
-                    # Credit the sale proceeds back
-                    proceeds = exit_price * trade["shares"]
-                    self.bankroll += round(proceeds, 2)
-
-                    trade["exit_price"] = exit_price
-                    trade["exit_reason"] = reason
-                    trade["exit_order_id"] = order_id
-                    trade["exit_ts"] = time.time()
-                    trade["exit_pnl"] = iv.exit_pnl
-
-                    save_state(self.trades, self.bankroll)
-
-                    print(f"  >> SOLD ({reason}) @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | order {order_id[:16]}...", flush=True)
-                    log_event("exit", {
-                        "slug": iv.slug, "reason": reason,
-                        "entry_price": trade["entry_price"],
-                        "exit_price": exit_price,
-                        "pnl": iv.exit_pnl,
-                        "bankroll": self.bankroll,
-                        "order_id": order_id,
-                    })
-                else:
-                    print(f"  [SELL FAILED] No order ID returned for {reason}", flush=True)
-                    log_event("sell_error", {"reason": reason, "error": "no order_id"})
-
+                    sell_price = None
             except Exception as e:
-                log_event("sell_error", {"error": str(e), "reason": reason})
-                print(f"  [SELL ERROR] {e}", flush=True)
-        finally:
-            iv.sell_in_progress = False
+                print(f"  [SELL] CLOB price fetch failed: {e}", flush=True)
+                sell_price = None
+
+        if sell_price is None:
+            # Last resort: sell at a discount to guarantee fill
+            sell_price = max(trade["entry_price"] * 0.5, 0.01)
+            print(f"  [WARN] Could not fetch sell price, using {sell_price:.3f}", flush=True)
+
+        # Floor price for sell — worst price we'll accept
+        floor_price = round(max(sell_price - 0.02, 0.01), 2)
+
+        # Check if sell meets $1 minimum — NEVER inflate shares beyond what we own
+        order_value = shares * floor_price
+        if order_value < 1.0:
+            print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — cannot sell", flush=True)
+            log_event("sell_error", {"reason": reason, "error": f"below $1 min: {shares} shares @ {floor_price}"})
+            # On forced exit, mark as exited anyway to avoid infinite retries
+            if reason == "forced_exit":
+                iv.exited = True
+                iv.exit_reason = "forced_exit_below_min"
+                iv.exit_pnl = 0
+            return
+
+        try:
+            # Aggressive GTC limit sell. If not filled by timeout, cancel and retry.
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=floor_price,
+                size=shares,
+                side="SELL",
+            )
+            print(f"  [SELL] GTC token={token_id[:16]}... price={floor_price} size={shares} reason={reason}", flush=True)
+
+            loop = asyncio.get_event_loop()
+            signed_order = await loop.run_in_executor(
+                None, lambda: self.clob.create_order(order_args)
+            )
+            result = await loop.run_in_executor(
+                None, lambda: self.clob.post_order(signed_order, OrderType.GTC)
+            )
+
+            # Parse response
+            error_msg = ""
+            order_id = None
+            if isinstance(result, dict):
+                error_msg = result.get("errorMsg", "")
+                order_id = result.get("orderID", "")
+            else:
+                order_id = str(result) if result else None
+
+            if error_msg:
+                print(f"  [SELL GTC REJECTED] {error_msg}", flush=True)
+                log_event("sell_error", {"error": error_msg, "reason": reason})
+                return
+
+            if order_id:
+                # Confirm fill details; timeout cancels stale order automatically.
+                filled_size, fill_price = await self._confirm_fill(order_id, max_wait=self.exit_order_timeout)
+                if filled_size <= 0:
+                    print(f"  [SELL UNFILLED] {order_id[:16]}... after {self.exit_order_timeout:.0f}s", flush=True)
+                    log_event("sell_error", {"reason": reason, "error": "unfilled_timeout", "order_id": order_id})
+                    return
+                exit_price = fill_price if fill_price > 0 else sell_price
+
+                # Use actual filled_size for P&L — not trade["shares"] — in case of partial fill
+                sold_shares = min(filled_size, trade["shares"])
+                pnl_est = (exit_price - trade["entry_price"]) * sold_shares
+                iv.exited = True
+                iv.exit_reason = reason
+                iv.exit_price = exit_price
+                iv.exit_pnl = round(pnl_est, 2)
+
+                # Credit the sale proceeds back (only for shares actually sold)
+                proceeds = exit_price * sold_shares
+                self.bankroll += round(proceeds, 2)
+
+                trade["exit_price"] = exit_price
+                trade["exit_reason"] = reason
+                trade["exit_order_id"] = order_id
+                trade["exit_ts"] = time.time()
+                trade["exit_pnl"] = iv.exit_pnl
+
+                save_state(self.trades, self.bankroll)
+
+                print(f"  >> SOLD ({reason}) @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | order {order_id[:16]}...", flush=True)
+                log_event("exit", {
+                    "slug": iv.slug, "reason": reason,
+                    "entry_price": trade["entry_price"],
+                    "exit_price": exit_price,
+                    "pnl": iv.exit_pnl,
+                    "bankroll": self.bankroll,
+                    "order_id": order_id,
+                })
+            else:
+                print(f"  [SELL FAILED] No order ID returned for {reason}", flush=True)
+                log_event("sell_error", {"reason": reason, "error": "no order_id"})
+
+        except Exception as e:
+            log_event("sell_error", {"error": str(e), "reason": reason})
+            print(f"  [SELL ERROR] {e}", flush=True)
 
     async def _resolve(self, iv):
         """Resolve a completed interval's trade.
@@ -1015,6 +1089,7 @@ class LiveTrader:
         wins = sum(1 for t in self.trades if t.get("won"))
         mode = "AUDIT" if self._audit else "LIVE"
         print(f"{mode} Trader | BTC 15-Min | ${self.bankroll:.2f} | {wins}/{len(self.trades)} trades")
+        print(f"Price feed: {self._feed_name} (set PRICE_FEED=binance to override)")
         print(f"Bet: ${self.bet_size} | Min move: {self.min_move_pct}% | Window: {self.entry_window[0]}-{self.entry_window[1]}s")
         print(f"Edge: >= {self.min_edge} | Max price: {self.max_entry_price}")
         print(f"Exit: TP {self.take_profit_pct:+.0%} / SL {-self.stop_loss_pct:+.0%} / Forced @ {self.exit_before_end}s before end | Monitor every {self.monitor_interval}s")
