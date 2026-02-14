@@ -50,7 +50,7 @@ MIN_EDGE = _env_float("MIN_EDGE", 0.02)
 MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 
 # Exit logic
-TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.50)   # sell when position is up +50%
+TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.25)   # sell when position is up +25%
 STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is down -25%
 EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
 MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 5)       # check price every 5 seconds
@@ -520,7 +520,7 @@ class LiveTrader:
             else:
                 fair = 0.70
 
-            edge = fair - our_price
+            edge = round(fair - our_price, 4)
 
             log_event("market_snapshot", {
                 "slug": iv.slug,
@@ -684,32 +684,47 @@ class LiveTrader:
                     await asyncio.sleep(1.0)
                     continue
 
-                # Handle both dict and object responses.
-                # Prefer actual execution price over limit price when available.
+                # Parse order fields — handle both dict and object responses.
                 if isinstance(order, dict):
                     size_matched = float(order.get("size_matched", 0))
                     original_size = float(order.get("original_size", 0))
-                    # Try known fields for actual fill price; fall back to limit price
-                    price = float(
-                        order.get("average_matched_price")
-                        or order.get("matched_price")
-                        or order.get("price", 0)
-                    )
                     status = order.get("status", "unknown")
+                    raw_avg = order.get("average_matched_price")
+                    raw_match = order.get("matched_price")
+                    raw_limit = order.get("price", 0)
                 else:
                     size_matched = float(getattr(order, "size_matched", 0))
                     original_size = float(getattr(order, "original_size", 0))
-                    price = float(
-                        getattr(order, "average_matched_price", None)
-                        or getattr(order, "matched_price", None)
-                        or getattr(order, "price", 0)
-                    )
                     status = getattr(order, "status", "unknown")
+                    raw_avg = getattr(order, "average_matched_price", None)
+                    raw_match = getattr(order, "matched_price", None)
+                    raw_limit = getattr(order, "price", 0)
 
-                print(f"  [FILL] status={status} filled={size_matched}/{original_size}", flush=True)
+                # Resolve fill price — explicit None/zero checks (do NOT use `or`
+                # chain because 0 and "0" are falsy in Python, masking valid values).
+                avg_price = float(raw_avg) if raw_avg is not None and str(raw_avg).strip() not in ("", "0") else 0.0
+                match_price = float(raw_match) if raw_match is not None and str(raw_match).strip() not in ("", "0") else 0.0
+                limit_price = float(raw_limit) if raw_limit else 0.0
+
+                if avg_price > 0:
+                    price = avg_price
+                elif match_price > 0:
+                    price = match_price
+                else:
+                    price = limit_price
+
+                print(f"  [FILL] status={status} filled={size_matched}/{original_size} | avg={raw_avg} match={raw_match} limit={raw_limit} -> price={price}", flush=True)
 
                 if size_matched > 0:
+                    # If we got the fill quantity but price is still the limit price
+                    # (avg/match not yet populated), do one extra poll to let the
+                    # API propagate the actual execution price.
+                    if avg_price == 0 and match_price == 0 and attempts < 3:
+                        print(f"  [FILL] Got fill but no avg price yet — re-polling...", flush=True)
+                        await asyncio.sleep(1.0)
+                        continue
                     return size_matched, price
+
                 if status in ("CANCELED", "CANCELLED", "EXPIRED"):
                     print(f"  [FILL] Order {status} — no fill", flush=True)
                     return 0, 0
