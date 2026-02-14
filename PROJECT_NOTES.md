@@ -79,12 +79,14 @@
 20. **Token ID ordering assumed, never validated** — `clobTokenIds[0]` was assumed to be "Up". Now reads the `outcomes` field from Gamma API and builds a lookup map.
 21. **Edge calculated on `best_ask`, order placed at `best_ask + 0.01`** — edge was 1 cent better than reality. Now edge is calculated against the actual buy price.
 22. **`last_signal_minute` served two conflicting purposes** — below-threshold logging and evaluation throttle used the same variable with overlapping ranges, defeating the 30s throttle. Split into `last_log_minute` and `last_eval_half_min`.
-23. **Fill price was limit price, not execution price** — `_confirm_fill` now tries `average_matched_price` / `matched_price` before falling back to limit `price`.
+23. **Fill price was limit price, not execution price** — `_confirm_fill` used Python `or` chain for price fallback, but `0` is falsy so `average_matched_price: 0` silently fell through to the limit price. Fixed with explicit None/zero checks, raw field logging (`avg=X match=Y limit=Z`), and a re-poll if fill quantity arrives before the average price.
 24. **Transient order failures locked out entire interval** — `trade_taken = True` was set before order submission. Now only set after the CLOB accepts the order, allowing retry on API errors.
+25. **Take profit too aggressive at 50%** — first successful trade peaked at +46% P&L, sat open for 7+ minutes without exiting. Lowered TP to 25% (get in and out faster, reduce exposure).
+26. **Floating-point edge comparison** — `0.70 - 0.68` = `0.01999...` in IEEE 754, causing trades at exactly MIN_EDGE to be rejected. Fixed with `round(edge, 4)`.
+27. **Startup allowance refresh failed for Conditional Tokens** — ERC1155 requires a valid `token_id` which we don't have at startup. Removed startup refresh for CONDITIONAL; real refresh happens before each sell with the actual token_id.
 
 ## Next Steps
-- Observe automated round-trips with Chainlink feed and allowance fix
-- Tune TP/SL based on observed price behavior with Chainlink data
+- Observe automated round-trips with current config (TP 25% / SL 25%)
 - Data-driven fair value calibration (backtest historical intervals)
 - Volatility normalization for move thresholds
 - WebSocket for CLOB monitoring (sub-second TP/SL)

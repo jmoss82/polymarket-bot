@@ -85,8 +85,10 @@ The bot estimates a "fair value" for the probability of the predicted outcome, t
 
 ```
 buy_price = min(best_ask + 0.01, 0.99)
-edge = fair_value - buy_price
+edge = round(fair_value - buy_price, 4)
 ```
+
+Edge is rounded to 4 decimal places to avoid IEEE 754 floating-point precision issues (e.g., `0.70 - 0.68` producing `0.019999...` instead of `0.02`).
 
 Fair value depends on signal strength and timing:
 
@@ -128,7 +130,9 @@ After placing a GTC buy, the bot polls for fill status with a configurable timeo
 
 - Polls `get_order(order_id)` every 1 second for up to **20 seconds** (`ENTRY_ORDER_TIMEOUT`)
 - If `size_matched > 0`: records actual fill size and price for accurate P&L
-- Prefers `average_matched_price` over the limit `price` when available
+- Prefers `average_matched_price` over the limit `price` when available — uses explicit None/zero checks (Python `or` chains treat `0` as falsy, masking valid values)
+- If fill quantity arrives before the average price, does one extra re-poll to let the API propagate the execution price
+- Logs raw `avg`/`match`/`limit` price fields for diagnostics
 - If `MATCHED` with `size_matched=0`: waits at least **5 poll cycles** before accepting (guards against phantom fills)
 - If status is "CANCELED"/"EXPIRED": order didn't fill, position skipped
 - **Timeout cancellation**: if not filled within the timeout, the bot calls `cancel(order_id)` to prevent stale orders resting on the book
@@ -155,7 +159,7 @@ Three exit triggers, checked in priority order:
 
 | Trigger | Condition | Default | Behavior |
 |---------|-----------|---------|----------|
-| **Take Profit** | `pnl_pct >= +50%` | `TAKE_PROFIT_PCT=0.50` | Sell to lock in gains |
+| **Take Profit** | `pnl_pct >= +25%` | `TAKE_PROFIT_PCT=0.25` | Sell to lock in gains |
 | **Stop Loss** | `pnl_pct <= -25%` | `STOP_LOSS_PCT=0.25` | Sell to cut losses |
 | **Forced Exit** | `remaining <= 60s` | `EXIT_BEFORE_END=60` | Sell before resolution regardless of P&L |
 
@@ -243,7 +247,7 @@ All parameters can be overridden via environment variables in Railway.
 
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
-| Take profit % | `TAKE_PROFIT_PCT` | 0.50 (+50%) | Sell when position is up this % from entry |
+| Take profit % | `TAKE_PROFIT_PCT` | 0.25 (+25%) | Sell when position is up this % from entry |
 | Stop loss % | `STOP_LOSS_PCT` | 0.25 (-25%) | Sell when position is down this % from entry |
 | Forced exit | `EXIT_BEFORE_END` | 60s | Force sell with this many seconds remaining |
 | Monitor interval | `MONITOR_INTERVAL` | 5s | How often to check CLOB prices |
