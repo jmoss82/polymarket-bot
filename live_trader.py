@@ -55,7 +55,7 @@ MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.25)   # sell when position is up +25%
 STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is down -25%
 EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
-MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 5)       # check price every 5 seconds
+MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 2)       # check price every 2 seconds
 
 # Risk management
 MAX_SESSION_LOSS = _env_float("MAX_SESSION_LOSS", 15.0)  # stop trading after $15 cumulative loss
