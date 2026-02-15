@@ -16,6 +16,7 @@ import traceback
 from datetime import datetime, timezone, timedelta
 from binance_ws import BinanceFeed
 from chainlink_ws import ChainlinkFeed
+from trend import TrendTracker
 from py_clob_client.client import ClobClient
 from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
 from config import (
@@ -206,6 +207,7 @@ class LiveTrader:
         else:
             self.feed = ChainlinkFeed(symbols=["BTC"], on_trade=self._on_trade)
             self._feed_name = "Chainlink"
+        self.trend = TrendTracker()
         self._http = None
         self._last_status_bucket = 0
         self._pending_resolve = None
@@ -371,7 +373,9 @@ class LiveTrader:
             self.current_interval = IntervalState(ts)
             self._last_status_bucket = 0
 
-            print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | ${self.bankroll:.2f} | {len(self.trades)} trades ---")
+            td = self.trend.get_detail()
+            trend_str = f" | trend={td['trend']}" if td['ready'] else ""
+            print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | ${self.bankroll:.2f} | {len(self.trades)} trades{trend_str} ---")
             log_event("interval_start", {"slug": self.current_interval.slug, "bankroll": self.bankroll})
 
             if prev and prev.trade:
@@ -385,6 +389,9 @@ class LiveTrader:
             print(f"  [ERR] {e}")
 
     async def _on_trade_inner(self, symbol, price, exchange_ts, local_ts):
+        # Update TEMA with every price tick (candle close triggers recalc)
+        self.trend.update_price(price, exchange_ts)
+
         self._rotate_interval()
 
         if self._pending_resolve:
@@ -418,7 +425,8 @@ class LiveTrader:
                 tag = " [no fill]"
             else:
                 tag = ""
-            print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}")
+            trend_tag = f" | trend={self.trend.get_trend()}"
+            print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}{trend_tag}")
 
         # Monitor open position for TP/SL/forced exit
         if iv.trade_taken and iv.trade and not iv.exited:
@@ -454,6 +462,21 @@ class LiveTrader:
         iv.last_eval_half_min = half_min
 
         signal = "Up" if iv.move_pct > 0 else "Down"
+
+        # TEMA trend filter — only enter if signal aligns with trend direction.
+        # When trend is "Neutral" (not enough data or TEMAs equal), skip filtering.
+        trend_dir = self.trend.get_trend()
+        if trend_dir != "Neutral" and signal != trend_dir:
+            td = self.trend.get_detail()
+            print(f"  [FILTERED] {strength} {signal} blocked — trend is {trend_dir} "
+                  f"(TEMA {td['tema_fast']:,.0f}/{td['tema_slow']:,.0f}, gap {td['gap_pct']:+.4f}%)", flush=True)
+            log_event("signal_filtered", {
+                "slug": iv.slug, "signal": signal, "strength": strength,
+                "trend": trend_dir, "tema_fast": td['tema_fast'], "tema_slow": td['tema_slow'],
+                "gap_pct": td['gap_pct'], "move": iv.move_pct,
+            })
+            return
+
         await self._evaluate(iv, signal, strength, price)
 
     async def _evaluate(self, iv, signal, strength, btc_price):
@@ -570,6 +593,9 @@ class LiveTrader:
             # Use actual fill data for position tracking
             actual_cost = round(filled_size * fill_price, 4)
 
+            # Capture trend state at entry for post-hoc analysis
+            entry_trend = self.trend.get_detail()
+
             iv.trade = {
                 "side": signal,
                 "entry_price": fill_price,
@@ -589,12 +615,15 @@ class LiveTrader:
                 "token_id": token_id,
                 "order_id": order_id,
                 "ts": time.time(),
+                "trend": entry_trend["trend"],
+                "tema_fast": entry_trend["tema_fast"],
+                "tema_slow": entry_trend["tema_slow"],
             }
             self.bankroll -= actual_cost
             save_state(self.trades, self.bankroll)
 
             self._trade_placed = True
-            print(f"  >> FILLED {strength} {signal} | {filled_size} shares @ {fill_price:.3f} (limit {buy_price:.2f}) | cost ${actual_cost:.2f} | order {order_id[:16]}...", flush=True)
+            print(f"  >> FILLED {strength} {signal} | {filled_size} shares @ {fill_price:.3f} (limit {buy_price:.2f}) | cost ${actual_cost:.2f} | trend={entry_trend['trend']} | order {order_id[:16]}...", flush=True)
             log_event("entry", {**iv.trade})
 
         except Exception as e:
@@ -1113,6 +1142,16 @@ class LiveTrader:
         if not self._log_and_check_funder():
             return
         self._log_balance()
+
+        # Bootstrap TEMA trend filter with historical candles
+        ok = await self.trend.bootstrap()
+        if not ok:
+            print("[WARN] TEMA bootstrap failed — trend filter disabled (all signals pass)", flush=True)
+        else:
+            td = self.trend.get_detail()
+            print(f"Trend filter: TEMA({self.trend.fast_period}/{self.trend.slow_period}) on "
+                  f"{self.trend.candle_interval // 60}min candles | {td['trend']}", flush=True)
+
         await self.feed.start()
 
     def _apply_audit_overrides(self):
