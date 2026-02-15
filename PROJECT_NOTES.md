@@ -10,15 +10,11 @@
 - Auto-deploys on each commit to `main`
 
 ## Current Focus
-- Running in **normal mode** with full entry/exit pipeline
-- **Chainlink price feed** via Polymarket RTDS — same oracle used for market resolution (replaced Binance)
-- **GTC limit orders with timeout+cancel** for both buys and sells
+- **TEMA trend filter** — TEMA(10)/TEMA(80) on 5-min candles, bootstrapped from Binance US, updated live from Chainlink. Only enters trades where signal direction matches trend direction.
+- **Chainlink price feed** via Polymarket RTDS — same oracle used for market resolution
+- **Full entry/exit pipeline** — GTC limit orders, pre-sell allowance refresh, fill confirmation, TP/SL/forced exit
 - Buy pricing: `best_ask + $0.01` (aggressive GTC limit to fill quickly)
 - Sell pricing: `best_bid - $0.02` floor (aggressive GTC limit sell)
-- **Pre-sell allowance refresh** via `update_balance_allowance(CONDITIONAL)` before every sell
-- Integer arithmetic ensures USDC cost has max 2 decimal places (API requirement)
-- Configurable timeouts: 20s for entry, 20s for exit — unfilled orders auto-cancelled
-- Entry pricing from CLOB orderbook (best ask, spread filter, depth logging)
 - Edge calculated against actual buy price (`best_ask + 0.01`), not bare `best_ask`
 - Outcome ordering validated from Gamma API `outcomes` field (never assumed)
 - Position monitoring via CLOB `get_midpoint()` every 5s
@@ -33,15 +29,13 @@
 - Conditional token allowances: set via Polymarket UI "Enable Trading", then `update_balance_allowance()` refreshes CLOB cache on startup and before each sell
 
 ## Key Files
-- **live_trader.py**: live trading logic, exit management, CLOB orderbook integration
+- **live_trader.py**: live trading logic, TEMA trend filter, exit management, CLOB orderbook integration
+- **trend.py**: TEMA(10/80) calculation on 5-min candles, Binance bootstrap, live candle updates
+- **entry_observer.py**: paper-mode tester — same signal + TEMA logic as live, with running W/L scoreboard
 - **chainlink_ws.py**: Chainlink price feed via Polymarket RTDS WebSocket (resolution-matched)
 - **binance_ws.py**: Binance price feed (fallback, set `PRICE_FEED=binance`)
 - **set_allowances.py**: standalone script for on-chain token approvals (USDC + CTF)
 - **e2e_test.py**: minimal 6-step end-to-end order test (diagnostic tool)
-- **paper_trader.py**: paper trading logic
-- **collector.py**: Binance/Polymarket data collector
-- **polymarket_ws.py**: Polymarket WebSocket feed (orderbook + trades, not yet integrated)
-- **discover_markets.py**: find active 15-min markets
 - **config.py**: environment variable loading (.env + Railway)
 
 ## Notes
@@ -85,10 +79,16 @@
 26. **Floating-point edge comparison** — `0.70 - 0.68` = `0.01999...` in IEEE 754, causing trades at exactly MIN_EDGE to be rejected. Fixed with `round(edge, 4)`.
 27. **Startup allowance refresh failed for Conditional Tokens** — ERC1155 requires a valid `token_id` which we don't have at startup. Removed startup refresh for CONDITIONAL; real refresh happens before each sell with the actual token_id.
 
+## Changes (2026-02-15)
+28. **TEMA trend filter added** — new `trend.py` module calculates TEMA(10) and TEMA(80) on 5-min candles. Historical candles bootstrapped from Binance US REST API on startup; updates live as each 5-min candle closes from Chainlink ticks. Signals that conflict with trend direction are blocked (`[FILTERED]`). When trend is "Neutral" (insufficient data or TEMAs equal), no filtering applied.
+29. **Entry observer upgraded** — `entry_observer.py` now includes TEMA filter and running W/L scoreboard. Supports `--no-filter` flag for baseline comparison. Paper testing showed ~50% win rate without trend filter, improved with filter active.
+30. **First successful live round-trip with TEMA** — Entered STRONG Up at $0.71 (trend=Up), position peaked at +16.2%, forced exit at 60s sold at $0.79 for $0.56 profit. Would have been $2.03 if held to resolution (confirmed win). Exit mechanics (TP/SL/forced) now fully functional.
+
 ## Next Steps
-- Observe automated round-trips with current config (TP 25% / SL 25%)
-- Data-driven fair value calibration (backtest historical intervals)
-- Volatility normalization for move thresholds
-- WebSocket for CLOB monitoring (sub-second TP/SL)
-- Position recovery on restart
-- Explore maker rebate strategies (20% rebate for providing liquidity)
+- Observe live trades with TEMA filter and current exit config (TP 25% / SL 25% / forced 60s)
+- Evaluate whether forced exit at 60s is leaving money on the table (first live trade: $0.56 vs $2.03 if held)
+- Redesign entry logic to use trend direction proactively (enter on discount, not confirmation)
+- Add reach ratio / volatility-based entry filtering (ATR + distance to PTB)
+- Volume-based indicators for conviction (CVD, RVOL, or VWAP)
+- Consider multi-timeframe TEMA (1-min for timing, 5-min for direction)
+- Dead zone for TEMA crossovers (minimum gap threshold before declaring trend)

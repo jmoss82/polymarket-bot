@@ -4,9 +4,9 @@
 
 This bot trades Polymarket's **BTC 15-minute Up/Down** binary markets using real-time **Chainlink** price data as its signal source.
 
-**Core thesis:** If BTC has moved meaningfully in one direction during a 15-minute interval, that momentum is likely to continue through resolution. The bot detects these moves via Chainlink's aggregated price feed (the same oracle Polymarket uses for resolution), then buys the corresponding Up or Down shares on Polymarket before the interval closes.
+**Core thesis:** If BTC has moved meaningfully in one direction during a 15-minute interval *and* the broader trend supports that direction, the momentum is likely to continue through resolution. The bot uses TEMA(10)/TEMA(80) on 5-minute candles to determine trend, detects intra-interval moves via Chainlink (the same oracle Polymarket uses for resolution), and only enters when both agree.
 
-The strategy is a momentum-based directional bet with edge filtering — it only enters when the predicted fair value exceeds the market's current price by a meaningful margin.
+The strategy is a trend-aligned momentum bet with edge filtering — it only enters when the signal direction matches the TEMA trend and the predicted fair value exceeds the market's current price by a meaningful margin.
 
 ---
 
@@ -43,6 +43,20 @@ Notes:
 
 ## Signal Logic
 
+### TEMA Trend Filter
+
+Before evaluating any intra-interval signals, the bot determines the broader trend using TEMA (Triple Exponential Moving Average) on 5-minute BTC candles:
+
+- **TEMA(10)** — fast line, tracks ~50 minutes of price action
+- **TEMA(80)** — slow line, tracks ~400 minutes (~6.7 hours) of price action
+- **Trend = "Up"** when TEMA(10) > TEMA(80)
+- **Trend = "Down"** when TEMA(10) < TEMA(80)
+- **Trend = "Neutral"** when insufficient data (no filtering applied)
+
+On startup, historical candles are bootstrapped from Binance US REST API (259 candles). TEMA updates live as each 5-minute candle closes from Chainlink price ticks.
+
+**Key behavior**: TEMA can update mid-interval (at each 5-min candle close), allowing the trend to flip within a single 15-minute segment. This was observed in testing — trend flipped from Up to Down mid-segment and correctly allowed a Down entry.
+
 ### Interval Tracking
 
 The bot aligns to 15-minute UTC boundaries and tracks BTC prices from Chainlink in real time:
@@ -68,12 +82,14 @@ Trades are only considered between **45 and 840 seconds** (0:45–14:00 minutes)
 
 Moves below 0.05% are ignored. MODERATE signals require more elapsed time because smaller moves are less reliable early in the interval.
 
-### Direction
+### Direction + Trend Alignment
 
-Simple momentum — trade in the direction of the move:
+Simple momentum — trade in the direction of the move, **but only if the trend agrees**:
 
-- BTC price **above** open → buy **Up**
-- BTC price **below** open → buy **Down**
+- BTC price **above** open → signal is **Up**
+- BTC price **below** open → signal is **Down**
+- **Signal must match TEMA trend direction** — if signal is "Down" but trend is "Up", the entry is blocked and logged as `[FILTERED]`
+- If trend is "Neutral", no filtering is applied (signal passes through)
 
 ### Outcome Validation
 
@@ -199,22 +215,25 @@ Default: stop after **$15 cumulative loss** (`MAX_SESSION_LOSS`).
 
 ## Known Limitations
 
-1. **Momentum-only**: Doesn't consider mean-reversion, volatility regimes, or order flow imbalance
+1. **Signal logic triggers opposite to trend**: Current move-from-open signal often fires in the wrong direction (noise), then gets filtered by TEMA. Many intervals produce no entry because the signal never fires in the trend direction.
 2. **Static fair values**: The 0.70/0.75/0.85 estimates are guesses, not calibrated from data
 3. **Single trade per interval**: No re-entry after early exit
 4. **REST polling for monitoring**: CLOB prices checked every 5s via REST, not WebSocket (up to 5s blind spot)
-5. **GTC fill latency**: Orders may take up to 20s to fill (vs. instant FOK), though aggressive pricing minimizes this
+5. **Forced exit at 60s may be too early**: First live win sold at $0.79 (forced exit) vs $1.00 resolution — left $1.47 on the table
+6. **No TEMA dead zone**: TEMAs 50 cents apart trigger same confidence as TEMAs $500 apart. Mid-crossover entries have low conviction.
+7. **5-min TEMA lags real-time shifts**: Can show "Up" when 1-min chart has clearly turned down
 
 ---
 
 ## Planned Improvements
 
-- **Data-driven fair values**: Backtest historical intervals to calibrate win rates by move size and timing
-- **Volatility normalization**: Scale move thresholds by realized volatility
-- **Persistence filter**: Require BTC move to hold for N seconds before entering
+- **Redesign entry logic**: Use TEMA direction proactively — look for discount entries (dips in uptrend) instead of waiting for confirmation
+- **Reach ratio**: Measure probability of BTC reaching the Price to Beat given ATR and time remaining
+- **Volume-based indicators**: CVD, RVOL, or VWAP for trade conviction
+- **Multi-timeframe TEMA**: 1-min TEMA for entry timing, 5-min for directional filter
+- **TEMA dead zone**: Minimum gap threshold before declaring trend (avoid low-confidence crossover entries)
 - **Trailing stop**: Lock in gains dynamically after hitting a profit threshold
 - **Time-decay TP/SL**: Shrink take-profit and tighten stop-loss as resolution approaches
-- **Multiple trades per interval**: Re-entry after early exit with cumulative risk limits
 - **WebSocket monitoring**: Stream CLOB orderbook updates for sub-second TP/SL reactions
 - **Position recovery on restart**: Check for open positions and resume monitoring
 
@@ -229,6 +248,14 @@ All parameters can be overridden via environment variables in Railway.
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
 | Price feed | `PRICE_FEED` | chainlink | Price source: `chainlink` (resolution-matched) or `binance` (fallback) |
+
+### Trend Filter
+
+| Parameter | Env Var | Default | Description |
+|-----------|---------|---------|-------------|
+| Candle interval | `TREND_CANDLE_INTERVAL` | 300 (5 min) | Candle size in seconds for TEMA calculation |
+| TEMA fast period | `TREND_FAST_PERIOD` | 10 | Fast TEMA period (10 x 5min = 50 min lookback) |
+| TEMA slow period | `TREND_SLOW_PERIOD` | 80 | Slow TEMA period (80 x 5min = 6.7 hr lookback) |
 
 ### Entry Parameters
 
