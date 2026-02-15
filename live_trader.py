@@ -10,6 +10,7 @@ REQUIRES .env with:
 """
 import asyncio
 import json
+import math
 import os
 import time
 import traceback
@@ -905,7 +906,7 @@ class LiveTrader:
 
         trade = iv.trade
         token_id = trade["token_id"]
-        shares = round(trade["shares"], 2)  # actual filled shares — never exceed this
+        shares = math.floor(trade["shares"] * 100) / 100  # truncate to 2 decimals — never round up
 
         # Refresh CLOB's view of our conditional token balance/allowance before selling.
         # Without this, the CLOB may reject the sell with "not enough balance / allowance"
