@@ -81,6 +81,8 @@ class ChainlinkFeed:
 
                     msg_count = 0
                     last_heartbeat = time.time()
+                    last_price_ts = time.time()
+                    DATA_TIMEOUT = 120  # force reconnect if no price for 2 minutes
 
                     async for msg in ws:
                         if not self._running:
@@ -91,8 +93,15 @@ class ChainlinkFeed:
                         # Periodic heartbeat log so we know messages are flowing
                         now = time.time()
                         if now - last_heartbeat >= 60:
-                            print(f"[ChainlinkFeed] Heartbeat: {msg_count} msgs, {self._trade_count} prices", flush=True)
+                            silence = now - last_price_ts
+                            print(f"[ChainlinkFeed] Heartbeat: {msg_count} msgs, {self._trade_count} prices | last price {silence:.0f}s ago", flush=True)
                             last_heartbeat = now
+
+                            # Watchdog: if no price data for too long, force reconnect
+                            if silence > DATA_TIMEOUT:
+                                print(f"[ChainlinkFeed] No price data for {silence:.0f}s — forcing reconnect", flush=True)
+                                await ws.close()
+                                break
 
                         try:
                             data = json.loads(msg)
@@ -139,6 +148,7 @@ class ChainlinkFeed:
                                 "local_ts": local_ts,
                             }
                             self._trade_count += 1
+                            last_price_ts = time.time()
 
                             # Log first price received
                             if self._trade_count == 1:
