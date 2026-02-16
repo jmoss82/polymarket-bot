@@ -12,12 +12,12 @@
 ## Current Focus
 - **TEMA trend filter** — TEMA(10)/TEMA(80) on 5-min candles, bootstrapped from Binance US, updated live from Chainlink. Only enters trades where signal direction matches trend direction.
 - **Chainlink price feed** via Polymarket RTDS — same oracle used for market resolution
-- **Full entry/exit pipeline** — GTC limit orders, pre-sell allowance refresh, fill confirmation, TP/SL/forced exit
+- **Full entry/exit pipeline** — GTC limit orders, resting target sell at $0.88, forced exit at 30s remaining
 - Buy pricing: `best_ask + $0.01` (aggressive GTC limit to fill quickly)
 - Sell pricing: `best_bid - $0.02` floor (aggressive GTC limit sell)
 - Edge calculated against actual buy price (`best_ask + 0.01`), not bare `best_ask`
 - Outcome ordering validated from Gamma API `outcomes` field (never assumed)
-- Position monitoring via CLOB `get_midpoint()` every 5s
+- Position monitoring every 2s — checks resting sell status, places target sell after settlement
 - Circuit breaker: stops trading after $15 session loss
 
 ## Wallet Setup (MetaMask + Gnosis Safe)
@@ -82,11 +82,16 @@
 ## Changes (2026-02-15)
 28. **TEMA trend filter added** — new `trend.py` module calculates TEMA(10) and TEMA(80) on 5-min candles. Historical candles bootstrapped from Binance US REST API on startup; updates live as each 5-min candle closes from Chainlink ticks. Signals that conflict with trend direction are blocked (`[FILTERED]`). When trend is "Neutral" (insufficient data or TEMAs equal), no filtering applied.
 29. **Entry observer upgraded** — `entry_observer.py` now includes TEMA filter and running W/L scoreboard. Supports `--no-filter` flag for baseline comparison. Paper testing showed ~50% win rate without trend filter, improved with filter active.
-30. **First successful live round-trip with TEMA** — Entered STRONG Up at $0.71 (trend=Up), position peaked at +16.2%, forced exit at 60s sold at $0.79 for $0.56 profit. Would have been $2.03 if held to resolution (confirmed win). Exit mechanics (TP/SL/forced) now fully functional.
+30. **First successful live round-trip with TEMA** — Entered STRONG Up at $0.71 (trend=Up), position peaked at +16.2%, forced exit at 60s sold at $0.79 for $0.56 profit. Would have been $2.03 if held to resolution (confirmed win).
+31. **Exit strategy overhauled** — removed percentage-based TP/SL entirely. New approach: resting GTC SELL at target price ($0.88) placed after buy fill, plus forced exit at 30s remaining. Targets the sweet spot between locking in gains and not capping upside too early.
+32. **Sell size truncation** — changed `round(shares, 2)` to `math.floor(shares * 100) / 100` in `_sell_position()` to prevent selling fractionally more shares than owned (caused "not enough balance / allowance" errors).
+33. **Non-blocking target sell placement** — moved resting sell placement from inline (blocked event loop 11+ seconds) into the monitor loop. Now tries every 2s after a 5s post-fill grace period, retrying indefinitely until settlement completes. Price feed stays live during settlement.
+34. **Chainlink watchdog timer** — if no price data received for 120s (even if WebSocket pings work), forces reconnect. Prevents silent data stalls.
+35. **Monitor interval reduced** — from 5s to 2s for faster target sell placement and forced exit timing.
 
 ## Next Steps
-- Observe live trades with TEMA filter and current exit config (TP 25% / SL 25% / forced 60s)
-- Evaluate whether forced exit at 60s is leaving money on the table (first live trade: $0.56 vs $2.03 if held)
+- Observe live trades with new exit strategy (target sell @ $0.88 + forced exit @ 30s)
+- Evaluate target price ($0.88) — may need tuning based on actual fill rates
 - Redesign entry logic to use trend direction proactively (enter on discount, not confirmation)
 - Add reach ratio / volatility-based entry filtering (ATR + distance to PTB)
 - Volume-based indicators for conviction (CVD, RVOL, or VWAP)

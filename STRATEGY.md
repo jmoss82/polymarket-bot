@@ -157,45 +157,45 @@ After placing a GTC buy, the bot polls for fill status with a configurable timeo
 
 ## Exit Logic (Auto-Sell)
 
-After entering a position, the bot monitors the live Polymarket price and can sell early.
+After entering a position, the bot uses two exit mechanisms: a resting target sell and a time-based forced exit.
 
-### Pre-Sell Allowance Refresh
+### Target Price Sell (Primary Exit)
 
-Before every sell attempt, the bot calls `update_balance_allowance(CONDITIONAL, token_id)` to refresh the CLOB server's view of the on-chain conditional token balance. Without this, the CLOB may reject sells with "not enough balance / allowance" because its cache doesn't reflect tokens from a recent buy.
+Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed target price (default $0.88). This sits on the book and fills automatically if the share price reaches the target at any point during the interval.
 
-### How It Works
+- **Non-blocking placement**: The target sell is placed by the monitor loop, not inline after the buy. This avoids blocking the Chainlink price feed during on-chain settlement delays.
+- **Settlement grace period**: Waits 5 seconds after buy fill before first attempt (tokens must settle on-chain).
+- **Automatic retries**: If placement fails due to settlement lag ("not enough balance / allowance"), the monitor loop retries every 2 seconds indefinitely until it succeeds or the interval ends.
+- **Allowance refresh**: Calls `update_balance_allowance(CONDITIONAL, token_id)` before each placement attempt.
 
-Every **5 seconds** (configurable), the bot fetches the live midpoint price from the CLOB orderbook and compares it to the entry price:
+### Forced Exit (Safety Net)
 
-```
-position_pnl_pct = (current_price - entry_price) / entry_price
-```
+If the target sell hasn't filled with **30 seconds remaining** before resolution:
 
-Three exit triggers, checked in priority order:
-
-| Trigger | Condition | Default | Behavior |
-|---------|-----------|---------|----------|
-| **Take Profit** | `pnl_pct >= +25%` | `TAKE_PROFIT_PCT=0.25` | Sell to lock in gains |
-| **Stop Loss** | `pnl_pct <= -25%` | `STOP_LOSS_PCT=0.25` | Sell to cut losses |
-| **Forced Exit** | `remaining <= 60s` | `EXIT_BEFORE_END=60` | Sell before resolution regardless of P&L |
+1. Cancel the resting target sell (if active)
+2. Place an aggressive market sell at `best_bid - $0.02`
+3. This is pure damage control — if we haven't hit our target by now, get out before resolution
 
 ### Sell Mechanics
 
-- All sells fetch the **actual CLOB bid price** (`get_price(token_id, "SELL")`) for floor pricing
-- Places an **aggressive GTC limit SELL** with a floor price of `best_bid - $0.02`
-- Uses `OrderArgs` with `size` in shares and `create_order()` + `post_order(order, OrderType.GTC)`
+- Share size is **truncated** to 2 decimal places (`math.floor(shares * 100) / 100`) to prevent selling fractionally more than owned
+- All forced sells fetch the **actual CLOB bid price** (`get_price(token_id, "SELL")`) for floor pricing
+- Places an **aggressive GTC limit SELL** with a floor of `best_bid - $0.02`
 - Polls `get_order()` for up to **20 seconds** (`EXIT_ORDER_TIMEOUT`) to confirm fill
-- If not filled within timeout, the order is **cancelled** and the attempt is retried
-- P&L uses actual `filled_size` from the sell (not the original entry shares) to handle partial fills correctly
-- **Never sells more shares than owned** — if order value < $1 minimum, the sell is skipped
 - **Max 3 sell attempts** — if all fail, marks position as exited to prevent spam
+
+### Why This Strategy
+
+- **No percentage-based TP/SL**: Old approach capped upside (TP at 25%) or exited on noise (SL at 25%). Share price swings early in an interval don't mean much — what matters is final direction.
+- **Fixed target at $0.88**: Captures meaningful profit without holding to the volatile final seconds. Entry at ~$0.70 means ~25% return.
+- **Time-based SL at 30s**: If we haven't hit $0.88 by the last 30 seconds, we were likely wrong. Exit to limit damage rather than risk binary resolution.
 
 ### Resolution After Early Exit
 
 When the interval ends:
 
-- If **already sold**: uses the sell P&L (no double-counting) and logs what would've happened if held
-- If **held to resolution**: uses the original binary win/lose logic
+- If **already sold** (target or forced): uses the sell P&L and logs what would've happened if held
+- If **held to resolution**: uses binary win/lose logic (shouldn't happen with current config)
 
 ---
 
@@ -218,23 +218,23 @@ Default: stop after **$15 cumulative loss** (`MAX_SESSION_LOSS`).
 1. **Signal logic triggers opposite to trend**: Current move-from-open signal often fires in the wrong direction (noise), then gets filtered by TEMA. Many intervals produce no entry because the signal never fires in the trend direction.
 2. **Static fair values**: The 0.70/0.75/0.85 estimates are guesses, not calibrated from data
 3. **Single trade per interval**: No re-entry after early exit
-4. **REST polling for monitoring**: CLOB prices checked every 5s via REST, not WebSocket (up to 5s blind spot)
-5. **Forced exit at 60s may be too early**: First live win sold at $0.79 (forced exit) vs $1.00 resolution — left $1.47 on the table
+4. **REST polling for monitoring**: CLOB prices checked every 2s via REST, not WebSocket
+5. **Target price is static**: $0.88 may not be optimal for all market conditions — may need dynamic adjustment
 6. **No TEMA dead zone**: TEMAs 50 cents apart trigger same confidence as TEMAs $500 apart. Mid-crossover entries have low conviction.
 7. **5-min TEMA lags real-time shifts**: Can show "Up" when 1-min chart has clearly turned down
+8. **Settlement lag is unpredictable**: Target sell placement depends on on-chain settlement speed, which varies
 
 ---
 
 ## Planned Improvements
 
 - **Redesign entry logic**: Use TEMA direction proactively — look for discount entries (dips in uptrend) instead of waiting for confirmation
+- **Dynamic target price**: Adjust target based on entry price, time remaining, or volatility instead of fixed $0.88
 - **Reach ratio**: Measure probability of BTC reaching the Price to Beat given ATR and time remaining
 - **Volume-based indicators**: CVD, RVOL, or VWAP for trade conviction
 - **Multi-timeframe TEMA**: 1-min TEMA for entry timing, 5-min for directional filter
 - **TEMA dead zone**: Minimum gap threshold before declaring trend (avoid low-confidence crossover entries)
-- **Trailing stop**: Lock in gains dynamically after hitting a profit threshold
-- **Time-decay TP/SL**: Shrink take-profit and tighten stop-loss as resolution approaches
-- **WebSocket monitoring**: Stream CLOB orderbook updates for sub-second TP/SL reactions
+- **WebSocket monitoring**: Stream CLOB orderbook updates for faster exit detection
 - **Position recovery on restart**: Check for open positions and resume monitoring
 
 ---
@@ -274,10 +274,9 @@ All parameters can be overridden via environment variables in Railway.
 
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
-| Take profit % | `TAKE_PROFIT_PCT` | 0.25 (+25%) | Sell when position is up this % from entry |
-| Stop loss % | `STOP_LOSS_PCT` | 0.25 (-25%) | Sell when position is down this % from entry |
-| Forced exit | `EXIT_BEFORE_END` | 60s | Force sell with this many seconds remaining |
-| Monitor interval | `MONITOR_INTERVAL` | 5s | How often to check CLOB prices |
+| Target price | `EXIT_TARGET_PRICE` | 0.88 | Resting GTC sell price (primary exit) |
+| Forced exit | `EXIT_BEFORE_END` | 30s | Force sell with this many seconds remaining |
+| Monitor interval | `MONITOR_INTERVAL` | 2s | How often to check position and try target sell placement |
 | Entry order timeout | `ENTRY_ORDER_TIMEOUT` | 20s | Seconds to wait for buy fill before cancelling |
 | Exit order timeout | `EXIT_ORDER_TIMEOUT` | 20s | Seconds to wait for sell fill before cancelling |
 
