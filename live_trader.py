@@ -52,10 +52,9 @@ MIN_EDGE = _env_float("MIN_EDGE", 0.02)
 MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.75)
 
 # Exit logic
-TAKE_PROFIT_PCT = _env_float("TAKE_PROFIT_PCT", 0.25)   # sell when position is up +25%
-STOP_LOSS_PCT = _env_float("STOP_LOSS_PCT", 0.25)       # sell when position is down -25%
-EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 60)        # forced sell with 60s remaining
-MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 2)       # check price every 2 seconds
+EXIT_TARGET_PRICE = _env_float("EXIT_TARGET_PRICE", 0.88)  # resting GTC sell at this price
+EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 30)          # forced sell with 30s remaining
+MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 2)         # check price every 2 seconds (logging only)
 
 # Risk management
 MAX_SESSION_LOSS = _env_float("MAX_SESSION_LOSS", 15.0)  # stop trading after $15 cumulative loss
@@ -167,11 +166,12 @@ class IntervalState:
         self.last_eval_half_min = -1    # throttle entry evaluations (per 30s)
         # Exit tracking
         self.exited = False
-        self.exit_reason = None      # "take_profit", "stop_loss", "forced_exit"
+        self.exit_reason = None      # "target_fill", "forced_exit"
         self.exit_price = None
         self.exit_pnl = None
         self.last_monitor_ts = 0     # throttle Polymarket price checks
         self.sell_attempts = 0       # cap retries on failed sells
+        self.tp_order_id = None      # resting GTC sell order for target price
 
     @property
     def elapsed(self):
@@ -224,8 +224,7 @@ class LiveTrader:
         self.entry_window = ENTRY_WINDOW
         self.min_edge = MIN_EDGE
         self.max_entry_price = MAX_ENTRY_PRICE
-        self.take_profit_pct = TAKE_PROFIT_PCT
-        self.stop_loss_pct = STOP_LOSS_PCT
+        self.exit_target_price = EXIT_TARGET_PRICE
         self.exit_before_end = EXIT_BEFORE_END
         self.monitor_interval = MONITOR_INTERVAL
         self.max_session_loss = MAX_SESSION_LOSS
@@ -627,6 +626,9 @@ class LiveTrader:
             print(f"  >> FILLED {strength} {signal} | {filled_size} shares @ {fill_price:.3f} (limit {buy_price:.2f}) | cost ${actual_cost:.2f} | trend={entry_trend['trend']} | order {order_id[:16]}...", flush=True)
             log_event("entry", {**iv.trade})
 
+            # Place resting GTC sell at target price immediately after entry
+            await self._place_target_sell(iv)
+
         except Exception as e:
             log_event("error", {"context": "evaluate", "error": str(e)})
             print(f"  [ERR evaluate] {e}")
@@ -846,47 +848,163 @@ class LiveTrader:
             return float(price.get("price", 0))
         return float(price)
 
+    async def _place_target_sell(self, iv):
+        """Place a resting GTC sell at the target price immediately after entry.
+        The CLOB will fill it automatically if the token price reaches the target."""
+        trade = iv.trade
+        token_id = trade["token_id"]
+        shares = math.floor(trade["shares"] * 100) / 100  # truncate — never sell more than owned
+
+        # Refresh allowance so the CLOB knows we have the tokens
+        try:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(
+                None, lambda: self.clob.update_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                )
+            )
+        except Exception as e:
+            print(f"  [TARGET] Allowance refresh failed (continuing): {e}", flush=True)
+
+        target_price = self.exit_target_price
+
+        # Check minimum order value
+        order_value = shares * target_price
+        if order_value < 1.0:
+            print(f"  [TARGET] Order value ${order_value:.2f} < $1 min — cannot place target sell", flush=True)
+            return
+
+        try:
+            order_args = OrderArgs(
+                token_id=token_id,
+                price=target_price,
+                size=shares,
+                side="SELL",
+            )
+            print(f"  [TARGET] Placing resting GTC SELL @ {target_price} for {shares} shares (~${order_value:.2f})", flush=True)
+
+            loop = asyncio.get_event_loop()
+            signed_order = await loop.run_in_executor(
+                None, lambda: self.clob.create_order(order_args)
+            )
+            result = await loop.run_in_executor(
+                None, lambda: self.clob.post_order(signed_order, OrderType.GTC)
+            )
+
+            # Parse response
+            error_msg = ""
+            order_id = None
+            if isinstance(result, dict):
+                error_msg = result.get("errorMsg", "")
+                order_id = result.get("orderID", "")
+            else:
+                order_id = str(result) if result else None
+
+            if error_msg:
+                print(f"  [TARGET] GTC SELL rejected: {error_msg}", flush=True)
+                log_event("target_sell_error", {"error": error_msg, "token_id": token_id})
+                return
+
+            if order_id:
+                iv.tp_order_id = order_id
+                trade["tp_order_id"] = order_id
+                print(f"  [TARGET] Resting sell placed: {order_id[:16]}... @ {target_price}", flush=True)
+                log_event("target_sell_placed", {
+                    "order_id": order_id, "target_price": target_price,
+                    "shares": shares, "token_id": token_id,
+                })
+            else:
+                print(f"  [TARGET] No order ID returned: {result}", flush=True)
+
+        except Exception as e:
+            print(f"  [TARGET] Failed to place target sell: {e}", flush=True)
+            log_event("target_sell_error", {"error": str(e), "token_id": token_id})
+
     async def _monitor_position(self, iv):
-        """Check current market price via CLOB orderbook and decide whether to exit."""
+        """Monitor position: check if resting sell filled, force exit at time limit."""
         now = time.time()
 
         # Forced exit — sell no matter what with EXIT_BEFORE_END seconds remaining
         if iv.remaining <= self.exit_before_end:
-            print(f"  [EXIT] Forced exit — {iv.remaining:.0f}s left before resolution", flush=True)
+            print(f"  [EXIT] Forced exit — {iv.remaining:.0f}s left", flush=True)
+
+            # Cancel resting target sell first to avoid double sell
+            if iv.tp_order_id:
+                try:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, lambda: self.clob.cancel(iv.tp_order_id))
+                    print(f"  [EXIT] Cancelled resting sell {iv.tp_order_id[:16]}...", flush=True)
+                except Exception as e:
+                    print(f"  [EXIT] Cancel resting sell failed: {e}", flush=True)
+                iv.tp_order_id = None
+
             await self._sell_position(iv, reason="forced_exit")
             return
 
-        # Throttle CLOB price checks
+        # Throttle monitoring checks
         if now - iv.last_monitor_ts < self.monitor_interval:
             return
         iv.last_monitor_ts = now
 
-        # Fetch live midpoint from CLOB orderbook (not Gamma)
         try:
             token_id = iv.trade["token_id"]
-            current_price = await self._get_clob_midpoint(token_id)
-
-            if not current_price or current_price <= 0:
-                print(f"  [MON] No CLOB price for token {token_id[:16]}...", flush=True)
-                return
-
             entry_price = iv.trade["entry_price"]
-            position_pnl_pct = (current_price - entry_price) / entry_price
 
-            # Log position status on each check
-            print(f"  [MON] {iv.trade['side']} | entry {entry_price:.3f} -> {current_price:.3f} | P&L {position_pnl_pct:+.1%} | {iv.remaining:.0f}s left", flush=True)
+            # Check if resting target sell has filled
+            if iv.tp_order_id:
+                loop = asyncio.get_event_loop()
+                order = await loop.run_in_executor(
+                    None, lambda: self.clob.get_order(iv.tp_order_id)
+                )
+                if order:
+                    if isinstance(order, dict):
+                        status = order.get("status", "")
+                        size_matched = float(order.get("size_matched", 0))
+                        raw_avg = order.get("average_matched_price")
+                    else:
+                        status = getattr(order, "status", "")
+                        size_matched = float(getattr(order, "size_matched", 0))
+                        raw_avg = getattr(order, "average_matched_price", None)
 
-            # Take profit — use actual bid for floor price, not midpoint
-            if position_pnl_pct >= self.take_profit_pct:
-                print(f"  [EXIT] Take profit: {position_pnl_pct:+.1%} (entry {entry_price:.3f} -> {current_price:.3f})", flush=True)
-                await self._sell_position(iv, reason="take_profit")
-                return
+                    if size_matched > 0:
+                        # Target sell filled!
+                        exit_price = float(raw_avg) if raw_avg and str(raw_avg).strip() not in ("", "0") else self.exit_target_price
+                        sold_shares = min(size_matched, iv.trade["shares"])
+                        pnl_est = (exit_price - entry_price) * sold_shares
+                        proceeds = exit_price * sold_shares
 
-            # Stop loss — use actual bid for floor price, not midpoint
-            if position_pnl_pct <= -self.stop_loss_pct:
-                print(f"  [EXIT] Stop loss: {position_pnl_pct:+.1%} (entry {entry_price:.3f} -> {current_price:.3f})", flush=True)
-                await self._sell_position(iv, reason="stop_loss")
-                return
+                        iv.exited = True
+                        iv.exit_reason = "target_fill"
+                        iv.exit_price = exit_price
+                        iv.exit_pnl = round(pnl_est, 2)
+                        iv.tp_order_id = None
+
+                        self.bankroll += round(proceeds, 2)
+                        iv.trade["exit_price"] = exit_price
+                        iv.trade["exit_reason"] = "target_fill"
+                        iv.trade["exit_order_id"] = iv.trade.get("tp_order_id", "")
+                        iv.trade["exit_ts"] = time.time()
+                        iv.trade["exit_pnl"] = iv.exit_pnl
+                        save_state(self.trades, self.bankroll)
+
+                        print(f"  >> TARGET FILLED @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | {iv.remaining:.0f}s left", flush=True)
+                        log_event("exit", {
+                            "slug": iv.slug, "reason": "target_fill",
+                            "entry_price": entry_price, "exit_price": exit_price,
+                            "pnl": iv.exit_pnl, "bankroll": self.bankroll,
+                        })
+                        return
+
+                    if status in ("CANCELED", "CANCELLED", "EXPIRED"):
+                        print(f"  [MON] Target sell {status} — no longer resting", flush=True)
+                        iv.tp_order_id = None
+
+            # Informational logging — fetch midpoint for visibility
+            current_price = await self._get_clob_midpoint(token_id)
+            if current_price and current_price > 0:
+                position_pnl_pct = (current_price - entry_price) / entry_price
+                resting = f" | target @ {self.exit_target_price}" if iv.tp_order_id else " | NO resting sell"
+                print(f"  [MON] {iv.trade['side']} | entry {entry_price:.3f} -> {current_price:.3f} | P&L {position_pnl_pct:+.1%} | {iv.remaining:.0f}s left{resting}", flush=True)
 
         except Exception as e:
             log_event("error", {"context": "monitor_position", "error": str(e)})
@@ -1035,12 +1153,22 @@ class LiveTrader:
         """Resolve a completed interval's trade.
 
         Two paths:
-        1. Early exit (TP/SL/forced) — position already sold, just log final outcome.
+        1. Early exit (target_fill/forced) — position already sold, just log final outcome.
         2. Hold to resolution — original behavior, settle based on BTC close.
         """
         if not iv.trade:
             return
         trade = iv.trade
+
+        # Cancel any resting target sell that didn't fill
+        if iv.tp_order_id:
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: self.clob.cancel(iv.tp_order_id))
+                print(f"  [RESOLVE] Cancelled unfilled target sell {iv.tp_order_id[:16]}...", flush=True)
+            except Exception as e:
+                print(f"  [RESOLVE] Cancel target sell failed: {e}", flush=True)
+            iv.tp_order_id = None
 
         try:
             went_up = iv.latest_price >= iv.open_price
@@ -1135,7 +1263,7 @@ class LiveTrader:
         print(f"Price feed: {self._feed_name} (set PRICE_FEED=binance to override)")
         print(f"Bet: ${self.bet_size} | Min move: {self.min_move_pct}% | Window: {self.entry_window[0]}-{self.entry_window[1]}s")
         print(f"Edge: >= {self.min_edge} | Max price: {self.max_entry_price}")
-        print(f"Exit: TP {self.take_profit_pct:+.0%} / SL {-self.stop_loss_pct:+.0%} / Forced @ {self.exit_before_end}s before end | Monitor every {self.monitor_interval}s")
+        print(f"Exit: Target sell @ {self.exit_target_price} | Forced @ {self.exit_before_end}s before end | Monitor every {self.monitor_interval}s")
         print(f"Order fills: entry timeout {self.entry_order_timeout:.0f}s | exit timeout {self.exit_order_timeout:.0f}s")
         print(f"Risk: Max session loss ${self.max_session_loss:.0f} | Max spread: {self.max_spread:.2f}")
         print(f"Logs: {TRADES_CSV}")
@@ -1167,11 +1295,10 @@ class LiveTrader:
         )
         self.min_edge = _env_float("AUDIT_MIN_EDGE", 0.0)
         self.max_entry_price = _env_float("AUDIT_MAX_ENTRY_PRICE", 0.98)
-        # Tighter exits for audit — quicker TP/SL to finish the round trip fast
-        self.take_profit_pct = _env_float("AUDIT_TAKE_PROFIT_PCT", 0.15)
-        self.stop_loss_pct = _env_float("AUDIT_STOP_LOSS_PCT", 0.15)
-        self.exit_before_end = _env_int("AUDIT_EXIT_BEFORE_END", 60)
-        self.monitor_interval = _env_int("AUDIT_MONITOR_INTERVAL", 10)
+        # Audit exits — lower target for faster round trip
+        self.exit_target_price = _env_float("AUDIT_EXIT_TARGET_PRICE", 0.80)
+        self.exit_before_end = _env_int("AUDIT_EXIT_BEFORE_END", 30)
+        self.monitor_interval = _env_int("AUDIT_MONITOR_INTERVAL", 2)
         self.entry_order_timeout = _env_float("AUDIT_ENTRY_ORDER_TIMEOUT", self.entry_order_timeout)
         self.exit_order_timeout = _env_float("AUDIT_EXIT_ORDER_TIMEOUT", self.exit_order_timeout)
 
