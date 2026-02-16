@@ -602,6 +602,8 @@ class LiveTrader:
                 "market_price_at_entry": our_price,
                 "limit_price": buy_price,
                 "shares": filled_size,
+                "entry_shares": filled_size,
+                "open_shares": filled_size,
                 "cost": actual_cost,
                 "btc_at_entry": btc_price,
                 "btc_open": iv.open_price,
@@ -618,6 +620,9 @@ class LiveTrader:
                 "trend": entry_trend["trend"],
                 "tema_fast": entry_trend["tema_fast"],
                 "tema_slow": entry_trend["tema_slow"],
+                "realized_proceeds": 0.0,
+                "realized_pnl": 0.0,
+                "tp_size_matched": 0.0,
             }
             self.bankroll -= actual_cost
             save_state(self.trades, self.bankroll)
@@ -696,18 +701,22 @@ class LiveTrader:
             return None
 
     async def _confirm_fill(self, order_id, max_wait=20.0):
-        """Poll fill details for an order. Returns (filled_size, avg_price) or (0, 0).
-        If not filled by max_wait, attempts cancellation and returns (0, 0)."""
+        """Poll fill details for an order.
+
+        Returns:
+            (filled_size, avg_price)
+        where filled_size can be partial if the order times out/cancels.
+        """
         loop = asyncio.get_event_loop()
         start = time.time()
         attempts = 0
+        last_matched = 0.0
+        last_price = 0.0
 
         while time.time() - start < max_wait:
             attempts += 1
             try:
-                order = await loop.run_in_executor(
-                    None, lambda: self.clob.get_order(order_id)
-                )
+                order = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
 
                 if not order:
                     print(f"  [FILL] No order data for {order_id[:16]}... (attempt {attempts})", flush=True)
@@ -730,41 +739,30 @@ class LiveTrader:
                     raw_match = getattr(order, "matched_price", None)
                     raw_limit = getattr(order, "price", 0)
 
-                # Resolve fill price — explicit None/zero checks (do NOT use `or`
-                # chain because 0 and "0" are falsy in Python, masking valid values).
                 avg_price = float(raw_avg) if raw_avg is not None and str(raw_avg).strip() not in ("", "0") else 0.0
                 match_price = float(raw_match) if raw_match is not None and str(raw_match).strip() not in ("", "0") else 0.0
                 limit_price = float(raw_limit) if raw_limit else 0.0
-
-                if avg_price > 0:
-                    price = avg_price
-                elif match_price > 0:
-                    price = match_price
-                else:
-                    price = limit_price
+                price = avg_price if avg_price > 0 else (match_price if match_price > 0 else limit_price)
 
                 print(f"  [FILL] status={status} filled={size_matched}/{original_size} | avg={raw_avg} match={raw_match} limit={raw_limit} -> price={price}", flush=True)
 
-                if size_matched > 0:
-                    # If we got the fill quantity but price is still the limit price
-                    # (avg/match not yet populated), do one extra poll to let the
-                    # API propagate the actual execution price.
+                if size_matched > last_matched:
+                    last_matched = size_matched
+                    if price > 0:
+                        last_price = price
+
+                # Do not treat any partial match as complete; wait for full size.
+                if original_size > 0 and size_matched >= original_size:
                     if avg_price == 0 and match_price == 0 and attempts < 3:
-                        print(f"  [FILL] Got fill but no avg price yet — re-polling...", flush=True)
+                        print("  [FILL] Full size matched but avg price pending — re-polling...", flush=True)
                         await asyncio.sleep(1.0)
                         continue
-                    return size_matched, price
+                    return size_matched, (price if price > 0 else last_price)
 
                 if status in ("CANCELED", "CANCELLED", "EXPIRED"):
-                    print(f"  [FILL] Order {status} — no fill", flush=True)
+                    if last_matched > 0:
+                        return last_matched, last_price
                     return 0, 0
-
-                # MATCHED with size_matched=0 is likely API lag — poll a few
-                # more times rather than immediately trusting it as a full fill.
-                # This prevents phantom fills that corrupt bankroll tracking.
-                if status == "MATCHED" and size_matched == 0 and attempts >= 5:
-                    print(f"  [FILL] MATCHED but size_matched=0 after {attempts} polls — accepting as filled", flush=True)
-                    return original_size, price
 
             except Exception as e:
                 print(f"  [FILL] Check error: {e}", flush=True)
@@ -777,7 +775,63 @@ class LiveTrader:
         except Exception as e:
             print(f"  [FILL] Timeout cancel failed: {e}", flush=True)
 
-        return 0, 0
+        # Best-effort fetch of final matched quantity after cancel.
+        try:
+            order = await loop.run_in_executor(None, lambda: self.clob.get_order(order_id))
+            if order:
+                if isinstance(order, dict):
+                    size_matched = float(order.get("size_matched", 0))
+                    raw_avg = order.get("average_matched_price")
+                    raw_match = order.get("matched_price")
+                    raw_limit = order.get("price", 0)
+                else:
+                    size_matched = float(getattr(order, "size_matched", 0))
+                    raw_avg = getattr(order, "average_matched_price", None)
+                    raw_match = getattr(order, "matched_price", None)
+                    raw_limit = getattr(order, "price", 0)
+                avg_price = float(raw_avg) if raw_avg is not None and str(raw_avg).strip() not in ("", "0") else 0.0
+                match_price = float(raw_match) if raw_match is not None and str(raw_match).strip() not in ("", "0") else 0.0
+                limit_price = float(raw_limit) if raw_limit else 0.0
+                final_price = avg_price if avg_price > 0 else (match_price if match_price > 0 else limit_price)
+                if size_matched > last_matched:
+                    last_matched = size_matched
+                if final_price > 0:
+                    last_price = final_price
+        except Exception:
+            pass
+
+        return last_matched, last_price
+
+    def _apply_target_match_delta(self, iv, matched_size, raw_avg):
+        """Book newly matched size from the resting target sell order."""
+        trade = iv.trade
+        prev_matched = float(trade.get("tp_size_matched", 0.0))
+        new_matched = max(float(matched_size) - prev_matched, 0.0)
+        if new_matched <= 0:
+            return
+
+        open_shares = float(trade.get("open_shares", trade.get("shares", 0.0)))
+        delta = min(new_matched, open_shares)
+        if delta <= 0:
+            return
+
+        exit_price = float(raw_avg) if raw_avg and str(raw_avg).strip() not in ("", "0") else self.exit_target_price
+        proceeds = exit_price * delta
+        pnl_delta = (exit_price - trade["entry_price"]) * delta
+
+        trade["tp_size_matched"] = prev_matched + delta
+        trade["open_shares"] = max(open_shares - delta, 0.0)
+        trade["realized_proceeds"] = float(trade.get("realized_proceeds", 0.0)) + proceeds
+        trade["realized_pnl"] = float(trade.get("realized_pnl", 0.0)) + pnl_delta
+
+        self.bankroll += round(proceeds, 2)
+        save_state(self.trades, self.bankroll)
+
+        print(
+            f"  [TARGET] Matched +{delta:.2f} @ {exit_price:.3f} | "
+            f"remaining {trade['open_shares']:.2f} shares",
+            flush=True,
+        )
 
     async def _get_order_book(self, token_id):
         """Get full orderbook from CLOB. Returns (best_bid, best_ask, bid_depth, ask_depth, spread) or Nones."""
@@ -852,7 +906,7 @@ class LiveTrader:
         Returns True if placed successfully, False otherwise."""
         trade = iv.trade
         token_id = trade["token_id"]
-        shares = math.floor(trade["shares"] * 100) / 100
+        shares = math.floor(float(trade.get("open_shares", trade["shares"])) * 100) / 100
         target_price = self.exit_target_price
 
         order_value = shares * target_price
@@ -934,13 +988,31 @@ class LiveTrader:
 
             # Cancel resting target sell first to avoid double sell
             if iv.tp_order_id:
+                tp_order_id = iv.tp_order_id
                 try:
                     loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, lambda: self.clob.cancel(iv.tp_order_id))
-                    print(f"  [EXIT] Cancelled resting sell {iv.tp_order_id[:16]}...", flush=True)
+                    await loop.run_in_executor(None, lambda: self.clob.cancel(tp_order_id))
+                    print(f"  [EXIT] Cancelled resting sell {tp_order_id[:16]}...", flush=True)
+
+                    # Capture any fills that happened before cancellation settled.
+                    order = await loop.run_in_executor(None, lambda: self.clob.get_order(tp_order_id))
+                    if order:
+                        if isinstance(order, dict):
+                            size_matched = float(order.get("size_matched", 0))
+                            raw_avg = order.get("average_matched_price")
+                        else:
+                            size_matched = float(getattr(order, "size_matched", 0))
+                            raw_avg = getattr(order, "average_matched_price", None)
+                        self._apply_target_match_delta(iv, size_matched, raw_avg)
                 except Exception as e:
                     print(f"  [EXIT] Cancel resting sell failed: {e}", flush=True)
                 iv.tp_order_id = None
+
+            if float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0))) <= 0:
+                iv.exited = True
+                iv.exit_reason = "target_fill"
+                iv.exit_pnl = round(float(iv.trade.get("realized_pnl", 0.0)), 2)
+                return
 
             await self._sell_position(iv, reason="forced_exit")
             return
@@ -975,30 +1047,27 @@ class LiveTrader:
                         raw_avg = getattr(order, "average_matched_price", None)
 
                     if size_matched > 0:
-                        # Target sell filled!
-                        exit_price = float(raw_avg) if raw_avg and str(raw_avg).strip() not in ("", "0") else self.exit_target_price
-                        sold_shares = min(size_matched, iv.trade["shares"])
-                        pnl_est = (exit_price - entry_price) * sold_shares
-                        proceeds = exit_price * sold_shares
+                        self._apply_target_match_delta(iv, size_matched, raw_avg)
 
+                    # Consider target exit complete only once all open shares are gone.
+                    if float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0))) <= 0:
                         iv.exited = True
                         iv.exit_reason = "target_fill"
-                        iv.exit_price = exit_price
-                        iv.exit_pnl = round(pnl_est, 2)
+                        iv.exit_price = self.exit_target_price
+                        iv.exit_pnl = round(float(iv.trade.get("realized_pnl", 0.0)), 2)
                         iv.tp_order_id = None
 
-                        self.bankroll += round(proceeds, 2)
-                        iv.trade["exit_price"] = exit_price
+                        iv.trade["exit_price"] = self.exit_target_price
                         iv.trade["exit_reason"] = "target_fill"
                         iv.trade["exit_order_id"] = iv.trade.get("tp_order_id", "")
                         iv.trade["exit_ts"] = time.time()
                         iv.trade["exit_pnl"] = iv.exit_pnl
                         save_state(self.trades, self.bankroll)
 
-                        print(f"  >> TARGET FILLED @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | {iv.remaining:.0f}s left", flush=True)
+                        print(f"  >> TARGET FILLED | P&L ${iv.exit_pnl:+.2f} | {iv.remaining:.0f}s left", flush=True)
                         log_event("exit", {
                             "slug": iv.slug, "reason": "target_fill",
-                            "entry_price": entry_price, "exit_price": exit_price,
+                            "entry_price": entry_price, "exit_price": self.exit_target_price,
                             "pnl": iv.exit_pnl, "bankroll": self.bankroll,
                         })
                         return
@@ -1032,7 +1101,8 @@ class LiveTrader:
 
         trade = iv.trade
         token_id = trade["token_id"]
-        shares = math.floor(trade["shares"] * 100) / 100  # truncate to 2 decimals — never round up
+        open_shares = float(trade.get("open_shares", trade.get("shares", 0.0)))
+        shares = math.floor(open_shares * 100) / 100  # truncate to 2 decimals — never round up
 
         # Refresh CLOB's view of our conditional token balance/allowance before selling.
         # Without this, the CLOB may reject the sell with "not enough balance / allowance"
@@ -1121,31 +1191,40 @@ class LiveTrader:
                 exit_price = fill_price if fill_price > 0 else sell_price
 
                 # Use actual filled_size for P&L — not trade["shares"] — in case of partial fill
-                sold_shares = min(filled_size, trade["shares"])
+                sold_shares = min(filled_size, open_shares)
                 pnl_est = (exit_price - trade["entry_price"]) * sold_shares
-                iv.exited = True
-                iv.exit_reason = reason
-                iv.exit_price = exit_price
-                iv.exit_pnl = round(pnl_est, 2)
+                remaining = max(open_shares - sold_shares, 0.0)
+                trade["open_shares"] = remaining
+                trade["realized_proceeds"] = float(trade.get("realized_proceeds", 0.0)) + (exit_price * sold_shares)
+                trade["realized_pnl"] = float(trade.get("realized_pnl", 0.0)) + pnl_est
 
                 # Credit the sale proceeds back (only for shares actually sold)
                 proceeds = exit_price * sold_shares
                 self.bankroll += round(proceeds, 2)
 
-                trade["exit_price"] = exit_price
-                trade["exit_reason"] = reason
-                trade["exit_order_id"] = order_id
-                trade["exit_ts"] = time.time()
-                trade["exit_pnl"] = iv.exit_pnl
+                if remaining <= 0:
+                    iv.exited = True
+                    iv.exit_reason = reason
+                    iv.exit_price = exit_price
+                    iv.exit_pnl = round(float(trade.get("realized_pnl", 0.0)), 2)
+                    trade["exit_price"] = exit_price
+                    trade["exit_reason"] = reason
+                    trade["exit_order_id"] = order_id
+                    trade["exit_ts"] = time.time()
+                    trade["exit_pnl"] = iv.exit_pnl
 
                 save_state(self.trades, self.bankroll)
 
-                print(f"  >> SOLD ({reason}) @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | order {order_id[:16]}...", flush=True)
+                print(
+                    f"  >> SOLD ({reason}) @ {exit_price:.3f} | P&L ${pnl_est:+.2f} | "
+                    f"remaining {remaining:.2f} | order {order_id[:16]}...",
+                    flush=True,
+                )
                 log_event("exit", {
                     "slug": iv.slug, "reason": reason,
                     "entry_price": trade["entry_price"],
                     "exit_price": exit_price,
-                    "pnl": iv.exit_pnl,
+                    "pnl": round(float(trade.get("realized_pnl", 0.0)), 2),
                     "bankroll": self.bankroll,
                     "order_id": order_id,
                 })
@@ -1170,10 +1249,22 @@ class LiveTrader:
 
         # Cancel any resting target sell that didn't fill
         if iv.tp_order_id:
+            tp_order_id = iv.tp_order_id
             try:
                 loop = asyncio.get_event_loop()
-                await loop.run_in_executor(None, lambda: self.clob.cancel(iv.tp_order_id))
-                print(f"  [RESOLVE] Cancelled unfilled target sell {iv.tp_order_id[:16]}...", flush=True)
+                await loop.run_in_executor(None, lambda: self.clob.cancel(tp_order_id))
+                print(f"  [RESOLVE] Cancelled unfilled target sell {tp_order_id[:16]}...", flush=True)
+
+                # Book any matched target shares before final resolution accounting.
+                order = await loop.run_in_executor(None, lambda: self.clob.get_order(tp_order_id))
+                if order:
+                    if isinstance(order, dict):
+                        size_matched = float(order.get("size_matched", 0))
+                        raw_avg = order.get("average_matched_price")
+                    else:
+                        size_matched = float(getattr(order, "size_matched", 0))
+                        raw_avg = getattr(order, "average_matched_price", None)
+                    self._apply_target_match_delta(iv, size_matched, raw_avg)
             except Exception as e:
                 print(f"  [RESOLVE] Cancel target sell failed: {e}", flush=True)
             iv.tp_order_id = None
@@ -1189,7 +1280,7 @@ class LiveTrader:
 
             if iv.exited:
                 # Already sold — use the P&L from the sell
-                pnl = iv.exit_pnl or 0
+                pnl = iv.exit_pnl if iv.exit_pnl is not None else round(float(trade.get("realized_pnl", 0.0)), 2)
                 won = pnl > 0
                 trade["won"] = won
                 trade["pnl"] = pnl
@@ -1202,15 +1293,23 @@ class LiveTrader:
                 held_result = "would've WON" if would_have_won else "would've LOST"
                 print(f"  << {result} ({iv.exit_reason}) | P&L ${pnl:+.2f} | {held_result} if held | Bank ${self.bankroll:.2f}")
             else:
-                # Held to resolution — original logic
+                # Held to resolution. Include realized partial exits, then settle
+                # remaining shares at binary resolution.
+                entry_shares = float(trade.get("entry_shares", trade.get("shares", 0.0)))
+                open_shares = float(trade.get("open_shares", trade.get("shares", 0.0)))
+                avg_entry_price = (trade["cost"] / entry_shares) if entry_shares > 0 else trade["entry_price"]
+                realized_pnl = float(trade.get("realized_pnl", 0.0))
+                realized_proceeds = float(trade.get("realized_proceeds", 0.0))
+
                 won = trade["side"] == winner
-                payout = trade["shares"] if won else 0
-                pnl = payout - trade["cost"]
-                self.bankroll += payout
+                unresolved_payout = open_shares if won else 0.0
+                unresolved_cost = open_shares * avg_entry_price
+                pnl = realized_pnl + (unresolved_payout - unresolved_cost)
+                self.bankroll += unresolved_payout
 
                 trade["won"] = won
                 trade["pnl"] = round(pnl, 2)
-                trade["payout"] = round(payout, 2)
+                trade["payout"] = round(realized_proceeds + unresolved_payout, 2)
                 trade["exit_type"] = "resolution"
 
                 result = "WIN" if won else "LOSS"
@@ -1289,7 +1388,11 @@ class LiveTrader:
             print(f"Trend filter: TEMA({self.trend.fast_period}/{self.trend.slow_period}) on "
                   f"{self.trend.candle_interval // 60}min candles | {td['trend']}", flush=True)
 
-        await self.feed.start()
+        try:
+            await self.feed.start()
+        finally:
+            if self._http and not self._http.closed:
+                await self._http.close()
 
     def _apply_audit_overrides(self):
         # Intentionally permissive to guarantee a single live fill quickly.

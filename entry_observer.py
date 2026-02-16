@@ -185,8 +185,9 @@ class EntryObserver:
                 e = prev.entry
                 final_move = prev.move_pct
                 final_vs_entry = ((prev.latest_price - e["btc_at_entry"]) / e["btc_at_entry"]) * 100
-                won_direction = (final_move > 0 and e["direction"] == "Up") or \
-                                (final_move < 0 and e["direction"] == "Down")
+                went_up = prev.latest_price >= prev.open_price
+                winner = "Up" if went_up else "Down"
+                won_direction = e["direction"] == winner
 
                 if won_direction:
                     self._wins += 1

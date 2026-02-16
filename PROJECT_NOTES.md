@@ -63,8 +63,8 @@
 12. GTC partial fills — one position filled in 3 incremental chunks (3.70, 3.00, 0.14 shares).
 13. FOK orders rejected → switched to FAK → FAK also rejected → **reverted to GTC with aggressive pricing** (`best_ask + $0.01` buys, `best_bid - $0.02` sells) plus timeout + auto-cancel. Most reliable path through the matching engine.
 14. Sells failing with `not enough balance / allowance` — root cause: `set_allowances()` doesn't exist in py-clob-client v0.34.5. Fixed by using `update_balance_allowance(AssetType.CONDITIONAL)` to refresh the CLOB server's allowance cache at startup and before each sell.
-15. MATCHED fallback in `_confirm_fill` created phantom fills — `MATCHED` with `size_matched=0` was immediately trusted as a full fill. Now requires 5 poll cycles before accepting.
-16. Exit P&L used `trade["shares"]` instead of actual `filled_size` — partial exit fills overcounted bankroll. Fixed to use `min(filled_size, trade["shares"])`.
+15. MATCHED fallback in `_confirm_fill` created phantom fills — `MATCHED` with `size_matched=0` should never be trusted as filled. Current logic requires nonzero matched quantity and full-size confirmation, with timeout+cancel preserving partial fills.
+16. Exit P&L used `trade["shares"]` instead of actual matched size — partial exits overcounted bankroll. Current logic tracks `open_shares` and books realized proceeds/P&L incrementally per fill delta.
 17. TP/SL sells used midpoint for floor price instead of actual bid — less aggressive than forced exits. Fixed: all sells now fetch the actual CLOB bid price.
 18. Forced exit triggered on every Binance tick before the monitor throttle — could spam sell attempts. (Structural issue, mitigated by sell_attempts cap.)
 
@@ -88,6 +88,9 @@
 33. **Non-blocking target sell placement** — moved resting sell placement from inline (blocked event loop 11+ seconds) into the monitor loop. Now tries every 2s after a 5s post-fill grace period, retrying indefinitely until settlement completes. Price feed stays live during settlement.
 34. **Chainlink watchdog timer** — if no price data received for 120s (even if WebSocket pings work), forces reconnect. Prevents silent data stalls.
 35. **Monitor interval reduced** — from 5s to 2s for faster target sell placement and forced exit timing.
+36. **Fill confirmation hardened** — removed status-only fill inference (`MATCHED` + `size_matched=0` no longer accepted). `_confirm_fill()` now waits for full matched size and returns partials only after cancel/terminal state.
+37. **Partial-fill accounting fixed end-to-end** — added `open_shares` + realized P&L/proceeds tracking. Target-sell matches are booked incrementally, forced exits sell only remaining shares, and resolution combines realized + unresolved portions correctly.
+38. **Observer tie rule fixed** — `entry_observer.py` now scores ties as **Up wins** (`close >= open`) to match Polymarket market rules and live trader logic.
 
 ## Next Steps
 - Observe live trades with new exit strategy (target sell @ $0.88 + forced exit @ 30s)

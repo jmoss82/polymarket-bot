@@ -145,13 +145,13 @@ If the order submission fails (API error, network issue), `trade_taken` is NOT s
 After placing a GTC buy, the bot polls for fill status with a configurable timeout:
 
 - Polls `get_order(order_id)` every 1 second for up to **20 seconds** (`ENTRY_ORDER_TIMEOUT`)
-- If `size_matched > 0`: records actual fill size and price for accurate P&L
+- Tracks matched quantity continuously and only treats the order as **fully filled** when `size_matched >= original_size`
 - Prefers `average_matched_price` over the limit `price` when available — uses explicit None/zero checks (Python `or` chains treat `0` as falsy, masking valid values)
-- If fill quantity arrives before the average price, does one extra re-poll to let the API propagate the execution price
+- If full size is matched but average price is not yet populated, does a short re-poll to let execution price propagate
 - Logs raw `avg`/`match`/`limit` price fields for diagnostics
-- If `MATCHED` with `size_matched=0`: waits at least **5 poll cycles** before accepting (guards against phantom fills)
+- Never infers fills from status text alone (`MATCHED` with `size_matched=0` is NOT accepted as a fill)
 - If status is "CANCELED"/"EXPIRED": order didn't fill, position skipped
-- **Timeout cancellation**: if not filled within the timeout, the bot calls `cancel(order_id)` to prevent stale orders resting on the book
+- **Timeout cancellation**: if not fully filled within the timeout, the bot calls `cancel(order_id)` to prevent stale orders; any partial fill is still captured and tracked
 
 ---
 
@@ -167,14 +167,16 @@ Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed 
 - **Settlement grace period**: Waits 5 seconds after buy fill before first attempt (tokens must settle on-chain).
 - **Automatic retries**: If placement fails due to settlement lag ("not enough balance / allowance"), the monitor loop retries every 2 seconds indefinitely until it succeeds or the interval ends.
 - **Allowance refresh**: Calls `update_balance_allowance(CONDITIONAL, token_id)` before each placement attempt.
+- **Partial-fill accounting**: Resting target sells can fill in chunks; each newly matched delta is booked immediately and reduces tracked `open_shares`.
 
 ### Forced Exit (Safety Net)
 
 If the target sell hasn't filled with **30 seconds remaining** before resolution:
 
 1. Cancel the resting target sell (if active)
-2. Place an aggressive market sell at `best_bid - $0.02`
-3. This is pure damage control — if we haven't hit our target by now, get out before resolution
+2. Re-read target order state after cancel and book any matched delta not yet accounted for
+3. Place an aggressive market sell at `best_bid - $0.02` for remaining open shares only
+4. This is pure damage control — if we haven't hit our target by now, get out before resolution
 
 ### Sell Mechanics
 
@@ -182,6 +184,7 @@ If the target sell hasn't filled with **30 seconds remaining** before resolution
 - All forced sells fetch the **actual CLOB bid price** (`get_price(token_id, "SELL")`) for floor pricing
 - Places an **aggressive GTC limit SELL** with a floor of `best_bid - $0.02`
 - Polls `get_order()` for up to **20 seconds** (`EXIT_ORDER_TIMEOUT`) to confirm fill
+- Forced sells can also be partially filled; realized proceeds/P&L are tracked incrementally and unresolved shares remain open
 - **Max 3 sell attempts** — if all fail, marks position as exited to prevent spam
 
 ### Why This Strategy
@@ -194,8 +197,9 @@ If the target sell hasn't filled with **30 seconds remaining** before resolution
 
 When the interval ends:
 
-- If **already sold** (target or forced): uses the sell P&L and logs what would've happened if held
-- If **held to resolution**: uses binary win/lose logic (shouldn't happen with current config)
+- If **already sold** (target or forced): uses realized sell P&L and logs what would've happened if held
+- If **partially sold**: carries realized P&L from sold shares, then settles only remaining `open_shares` at binary resolution
+- If **fully held**: uses binary win/lose logic on full size
 
 ---
 
