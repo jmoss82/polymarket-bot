@@ -848,24 +848,12 @@ class LiveTrader:
             return float(price.get("price", 0))
         return float(price)
 
-    async def _place_target_sell(self, iv):
-        """Place a resting GTC sell at the target price immediately after entry.
-        The CLOB will fill it automatically if the token price reaches the target."""
+    async def _place_target_sell(self, iv, max_retries=3):
+        """Place a resting GTC sell at the target price after entry.
+        Retries with delay to handle settlement lag (tokens not yet on-chain)."""
         trade = iv.trade
         token_id = trade["token_id"]
         shares = math.floor(trade["shares"] * 100) / 100  # truncate — never sell more than owned
-
-        # Refresh allowance so the CLOB knows we have the tokens
-        try:
-            loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None, lambda: self.clob.update_balance_allowance(
-                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
-                )
-            )
-        except Exception as e:
-            print(f"  [TARGET] Allowance refresh failed (continuing): {e}", flush=True)
-
         target_price = self.exit_target_price
 
         # Check minimum order value
@@ -874,51 +862,82 @@ class LiveTrader:
             print(f"  [TARGET] Order value ${order_value:.2f} < $1 min — cannot place target sell", flush=True)
             return
 
-        try:
-            order_args = OrderArgs(
-                token_id=token_id,
-                price=target_price,
-                size=shares,
-                side="SELL",
-            )
-            print(f"  [TARGET] Placing resting GTC SELL @ {target_price} for {shares} shares (~${order_value:.2f})", flush=True)
-
-            loop = asyncio.get_event_loop()
-            signed_order = await loop.run_in_executor(
-                None, lambda: self.clob.create_order(order_args)
-            )
-            result = await loop.run_in_executor(
-                None, lambda: self.clob.post_order(signed_order, OrderType.GTC)
-            )
-
-            # Parse response
-            error_msg = ""
-            order_id = None
-            if isinstance(result, dict):
-                error_msg = result.get("errorMsg", "")
-                order_id = result.get("orderID", "")
+        for attempt in range(1, max_retries + 1):
+            # Wait for on-chain settlement before first attempt, shorter waits on retries
+            if attempt == 1:
+                print(f"  [TARGET] Waiting 5s for on-chain settlement...", flush=True)
+                await asyncio.sleep(5)
             else:
-                order_id = str(result) if result else None
+                print(f"  [TARGET] Retry {attempt}/{max_retries} — waiting 3s...", flush=True)
+                await asyncio.sleep(3)
 
-            if error_msg:
-                print(f"  [TARGET] GTC SELL rejected: {error_msg}", flush=True)
-                log_event("target_sell_error", {"error": error_msg, "token_id": token_id})
+            # Refresh allowance so the CLOB knows we have the tokens
+            try:
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None, lambda: self.clob.update_balance_allowance(
+                        BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                    )
+                )
+            except Exception as e:
+                print(f"  [TARGET] Allowance refresh failed (continuing): {e}", flush=True)
+
+            try:
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=target_price,
+                    size=shares,
+                    side="SELL",
+                )
+                print(f"  [TARGET] Placing resting GTC SELL @ {target_price} for {shares} shares (~${order_value:.2f})", flush=True)
+
+                loop = asyncio.get_event_loop()
+                signed_order = await loop.run_in_executor(
+                    None, lambda: self.clob.create_order(order_args)
+                )
+                result = await loop.run_in_executor(
+                    None, lambda: self.clob.post_order(signed_order, OrderType.GTC)
+                )
+
+                # Parse response
+                error_msg = ""
+                order_id = None
+                if isinstance(result, dict):
+                    error_msg = result.get("errorMsg", "")
+                    order_id = result.get("orderID", "")
+                else:
+                    order_id = str(result) if result else None
+
+                if error_msg:
+                    print(f"  [TARGET] GTC SELL rejected: {error_msg}", flush=True)
+                    if "not enough balance" in str(error_msg).lower() and attempt < max_retries:
+                        continue  # retry after settlement delay
+                    log_event("target_sell_error", {"error": error_msg, "token_id": token_id})
+                    return
+
+                if order_id:
+                    iv.tp_order_id = order_id
+                    trade["tp_order_id"] = order_id
+                    print(f"  [TARGET] Resting sell placed: {order_id[:16]}... @ {target_price}", flush=True)
+                    log_event("target_sell_placed", {
+                        "order_id": order_id, "target_price": target_price,
+                        "shares": shares, "token_id": token_id,
+                    })
+                    return  # success
+                else:
+                    print(f"  [TARGET] No order ID returned: {result}", flush=True)
+                    return
+
+            except Exception as e:
+                err_str = str(e).lower()
+                if "not enough balance" in err_str and attempt < max_retries:
+                    print(f"  [TARGET] Settlement lag — will retry: {e}", flush=True)
+                    continue
+                print(f"  [TARGET] Failed to place target sell: {e}", flush=True)
+                log_event("target_sell_error", {"error": str(e), "token_id": token_id})
                 return
 
-            if order_id:
-                iv.tp_order_id = order_id
-                trade["tp_order_id"] = order_id
-                print(f"  [TARGET] Resting sell placed: {order_id[:16]}... @ {target_price}", flush=True)
-                log_event("target_sell_placed", {
-                    "order_id": order_id, "target_price": target_price,
-                    "shares": shares, "token_id": token_id,
-                })
-            else:
-                print(f"  [TARGET] No order ID returned: {result}", flush=True)
-
-        except Exception as e:
-            print(f"  [TARGET] Failed to place target sell: {e}", flush=True)
-            log_event("target_sell_error", {"error": str(e), "token_id": token_id})
+        print(f"  [TARGET] All {max_retries} attempts failed — no resting sell", flush=True)
 
     async def _monitor_position(self, iv):
         """Monitor position: check if resting sell filled, force exit at time limit."""
