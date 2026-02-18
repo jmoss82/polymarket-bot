@@ -59,6 +59,10 @@ MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 2)         # check price every 2
 EXIT_MONITOR_START = _env_int("EXIT_MONITOR_START", 600)     # seconds into interval before TEMA exit active
 EXIT_CUSHION_PCT = _env_float("EXIT_CUSHION_PCT", 0.05)      # don't TEMA-exit if winning by more than this %
 
+# Dust threshold — truncation + fees leave unsellable fractional shares.
+# Treat anything below this as "position closed."
+DUST_THRESHOLD = 0.01
+
 # Risk management
 MAX_SESSION_LOSS = _env_float("MAX_SESSION_LOSS", 15.0)  # stop trading after $15 cumulative loss
 MAX_SPREAD = _env_float("MAX_SPREAD", 0.06)              # skip entry if spread > 6 cents
@@ -1142,7 +1146,7 @@ class LiveTrader:
                                 print(f"  [TEMA] Cancel resting sell failed: {e}", flush=True)
                             iv.tp_order_id = None
 
-                        if float(trade.get("open_shares", trade.get("shares", 0.0))) > 0:
+                        if float(trade.get("open_shares", trade.get("shares", 0.0))) >= DUST_THRESHOLD:
                             await self._sell_position(iv, reason="tema_exit")
                         else:
                             iv.exited = True
@@ -1179,10 +1183,12 @@ class LiveTrader:
                     print(f"  [EXIT] Cancel resting sell failed: {e}", flush=True)
                 iv.tp_order_id = None
 
-            if float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0))) <= 0:
+            remaining_shares = float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0)))
+            if remaining_shares < DUST_THRESHOLD:
                 iv.exited = True
                 iv.exit_reason = "target_fill"
                 iv.exit_pnl = round(float(iv.trade.get("realized_pnl", 0.0)), 2)
+                print(f"  [EXIT] Target already filled (dust={remaining_shares:.4f}) | P&L ${iv.exit_pnl:+.2f}", flush=True)
                 return
 
             await self._sell_position(iv, reason="forced_exit")
@@ -1220,8 +1226,8 @@ class LiveTrader:
                     if size_matched > 0:
                         self._apply_target_match_delta(iv, size_matched, raw_avg)
 
-                    # Consider target exit complete only once all open shares are gone.
-                    if float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0))) <= 0:
+                    # Consider target exit complete once open shares are below dust threshold.
+                    if float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0))) < DUST_THRESHOLD:
                         iv.exited = True
                         iv.exit_reason = "target_fill"
                         iv.exit_price = self.exit_target_price
@@ -1318,13 +1324,12 @@ class LiveTrader:
         # Check if sell meets $1 minimum — NEVER inflate shares beyond what we own
         order_value = shares * floor_price
         if order_value < 1.0:
-            print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — cannot sell", flush=True)
-            log_event("sell_error", {"reason": reason, "error": f"below $1 min: {shares} shares @ {floor_price}"})
-            # On forced exit, mark as exited anyway to avoid infinite retries
-            if reason == "forced_exit":
-                iv.exited = True
-                iv.exit_reason = "forced_exit_below_min"
-                iv.exit_pnl = 0
+            realized_pnl = round(float(trade.get("realized_pnl", 0.0)), 2)
+            print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — dust, using realized P&L ${realized_pnl:+.2f}", flush=True)
+            log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": realized_pnl})
+            iv.exited = True
+            iv.exit_reason = "target_fill" if realized_pnl > 0 else f"{reason}_below_min"
+            iv.exit_pnl = realized_pnl
             return
 
         try:
