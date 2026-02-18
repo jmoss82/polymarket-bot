@@ -1,4 +1,4 @@
-# Trading Strategy
+# Trading Strategy (v5)
 
 ## Overview
 
@@ -29,10 +29,11 @@ For example, if "Up" is trading at $0.45, the market implies a 45% chance BTC wi
 | Purpose | Source | Why |
 |---------|--------|-----|
 | BTC price (signals) | **Chainlink via Polymarket RTDS** | Same oracle used for market resolution |
-| Market discovery | **Gamma API** | Slug → token ID mapping, market metadata, outcome ordering |
+| Market discovery | **Gamma API** | Slug -> token ID mapping, market metadata, outcome ordering |
 | Entry pricing | **CLOB orderbook** (`get_order_book`) | Live best bid/ask, spread, depth |
 | Position monitoring | **CLOB orderbook** (`get_midpoint`) | Live mid-market price for TP/SL |
 | Sell pricing | **CLOB orderbook** (`get_price`) | Live best bid for immediate fills |
+| Historical candles | **Binance REST API** | Bootstrap data for TEMA and HTF EMA indicators |
 
 Notes:
 - The Gamma API's `outcomePrices` field is **cached and stale** (updates every few minutes). It is NOT used for pricing — only for market discovery.
@@ -49,18 +50,14 @@ The bot uses empirically calibrated fair values instead of static guesses. The t
 
 Each cell answers: **"When BTC has moved X% from open at Y seconds into the interval, what % of the time does it close in that direction?"**
 
-| Move % | 60–180s | 180–420s | 420–600s | 600–840s |
+| Move % | 60-180s | 180-420s | 420-600s | 600-840s |
 |--------|---------|----------|----------|----------|
-| 0.03–0.05% | 59.8% | 65.2% | 69.7% | 80.0% |
-| 0.05–0.10% | 65.5% | 71.4% | 77.3% | 87.1% |
-| 0.10–0.20% | 68.6% | 77.7% | 85.6% | 94.3% |
+| 0.03-0.05% | 59.8% | 65.2% | 69.7% | 80.0% |
+| 0.05-0.10% | 65.5% | 71.4% | 77.3% | 87.1% |
+| 0.10-0.20% | 68.6% | 77.7% | 85.6% | 94.3% |
 | 0.20%+ | 74.5% | 86.7% | 93.6% | 98.2% |
 
-Key insight from calibration: **elapsed time is a stronger predictor than move size**. A small 0.03–0.05% move at 600+ seconds has a higher win rate (80%) than a large 0.10–0.20% move in the first 3 minutes (68.6%).
-
-### TEMA Finding
-
-Calibration also measured TEMA(10)/TEMA(80) alignment impact. Result: **TEMA provides zero predictive lift** — TEMA-aligned observations (78.7% win rate) perform identically to TEMA-opposed observations (79.0%). The move-from-open signal does all the work. TEMA was removed as an entry filter. It still runs for diagnostics/logging but does not gate entries.
+Key insight from calibration: **elapsed time is a stronger predictor than move size**. A small 0.03-0.05% move at 600+ seconds has a higher win rate (80%) than a large 0.10-0.20% move in the first 3 minutes (68.6%).
 
 ### Interval Tracking
 
@@ -73,23 +70,37 @@ The bot aligns to 15-minute UTC boundaries and tracks BTC prices from Chainlink 
 
 ### Entry Window
 
-Trades are only considered between **60 and 840 seconds** (1:00–14:00 minutes) into the interval:
+Trades are only considered between **60 and 840 seconds** (1:00-14:00 minutes) into the interval:
 
 - **First 60 seconds skipped**: lets the open price stabilize (aligned with calibration data)
 - **Last 1 minute skipped**: avoids stale entries too close to resolution
+
+### First Interval Skip
+
+On startup, the bot skips the first (partial) interval entirely. The open price captured mid-interval is unreliable, and indicator bootstrapping may still be settling. Trading begins from the second full interval.
 
 ### Signal Evaluation
 
 On each price tick within the entry window:
 
 1. Compute `abs_move = abs(move_pct)`
-2. If `abs_move < 0.03%` → skip (below minimum threshold)
-3. Look up `(abs_move, elapsed)` in the fair value table → get calibrated win rate
-4. If no matching bucket → skip
-5. Direction: BTC above open → "Up", below → "Down"
-6. Proceed to edge calculation against live orderbook
+2. If `abs_move < 0.03%` -> skip (below minimum threshold)
+3. Look up `(abs_move, elapsed)` in the fair value table -> get calibrated win rate
+4. If no matching bucket -> skip
+5. Direction: BTC above open -> "Up", below -> "Down"
+6. Check HTF EMA alignment (see below)
+7. Proceed to edge calculation against live orderbook
 
-There is no STRONG/MODERATE classification. The table encodes the relationship between move size, timing, and win probability directly.
+### HTF EMA Entry Filter
+
+An EMA(5) on 15-minute candles provides a higher-timeframe trend filter. On startup, it bootstraps from Binance historical 15-minute candles, then updates live as each 15-minute candle closes from Chainlink ticks.
+
+- **Signal direction must align with HTF EMA direction** to proceed
+- If BTC is above the EMA -> trend is Up, only "Up" entries allowed
+- If BTC is below the EMA -> trend is Down, only "Down" entries allowed
+- If EMA has insufficient data -> no filtering applied (pass-through)
+
+Paper testing showed meaningful win rate improvement with this filter active.
 
 ### Outcome Validation
 
@@ -114,9 +125,11 @@ All of these must pass before an order is placed:
 1. **Edge >= 0.02** — the calibrated fair value must exceed the buy price by at least 2 cents
 2. **Buy price <= 0.95** — don't buy shares priced above 95 cents
 3. **Spread <= 0.06** — skip if bid/ask spread exceeds 6 cents (liquidity too thin)
-4. **Market accepting orders** — Polymarket must have the market open for trading
-5. **One trade per interval** — the first accepted order locks out the rest
-6. **Circuit breaker off** — session loss must be below the max threshold
+4. **HTF EMA aligned** — signal direction must match the higher-timeframe EMA trend
+5. **Not first interval** — skip the partial interval after startup
+6. **Market accepting orders** — Polymarket must have the market open for trading
+7. **One trade per interval** — the first accepted order locks out the rest
+8. **Circuit breaker off** — session loss must be below the max threshold
 
 ### Entry Retry
 
@@ -147,51 +160,77 @@ After placing a GTC buy, the bot polls for fill status with a configurable timeo
 - If status is "CANCELED"/"EXPIRED": order didn't fill, position skipped
 - **Timeout cancellation**: if not fully filled within the timeout, the bot calls `cancel(order_id)` to prevent stale orders; any partial fill is still captured and tracked
 
+### Fee-Adjusted Share Tracking
+
+Polymarket (or the underlying Polygon gas layer) deducts fees from the shares received, so the actual number of shares credited is slightly less than the order fill reports. For example, a fill of 8.30 shares may result in only 8.17 shares on-chain.
+
+Before placing any sell order, the bot queries the actual conditional token balance via `get_balance_allowance()` and adjusts `open_shares` downward if the real balance is less than tracked. This prevents "not enough balance" rejections on sell orders.
+
 ---
 
-## Exit Logic (Auto-Sell)
+## Exit Logic (Three Exit Paths)
 
-After entering a position, the bot uses two exit mechanisms: a resting target sell and a time-based forced exit.
+After entering a position, the bot uses three exit mechanisms in priority order:
 
-### Target Price Sell (Primary Exit)
+### 1. TEMA Dynamic Exit (Smart Stop Loss)
 
-Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed target price (default $0.95). This sits on the book and fills automatically if the share price reaches the target at any point during the interval.
+A 1-minute TEMA(5)/TEMA(12) crossover detects when the short-term trend turns against the position mid-interval. This is a "the story changed" exit — it cuts losses early when momentum reverses.
 
-- **Non-blocking placement**: The target sell is placed by the monitor loop, not inline after the buy. This avoids blocking the Chainlink price feed during on-chain settlement delays.
+**How it works:**
+- TEMA(5) and TEMA(12) are computed on 1-minute candles from Chainlink ticks, bootstrapped from Binance on startup
+- On each price tick, the bot checks if the TEMA trend has *crossed* (changed direction), not just whether TEMAs are misaligned
+- A cross against the position direction (e.g., TEMA turns Down while holding Up) triggers an early sell
+
+**Safeguards:**
+- **Time gate** (`EXIT_MONITOR_START = 600`): Crosses before minute 10 of the interval are ignored. Early-interval TEMA crosses are noise — the position needs time to develop.
+- **Cushion filter** (`EXIT_CUSHION_PCT = 0.05`): If the trade is winning by more than 0.05% vs the interval open price when a cross occurs, the exit is skipped. The cross stays pending — if the cushion erodes below the threshold later, the exit fires. This prevents cutting winners that are comfortably ahead.
+
+**On trigger:**
+1. Cancel any resting target sell order
+2. Place an aggressive market sell at `best_bid - $0.02`
+3. Mark position as TEMA-exited
+
+### 2. Target Price Sell (Profit Taking)
+
+Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed target price (default $0.95). This sits on the book and fills automatically if the share price reaches the target.
+
+- **Non-blocking placement**: Placed by the monitor loop, not inline after the buy, to avoid blocking the price feed during settlement.
 - **Settlement grace period**: Waits 5 seconds after buy fill before first attempt (tokens must settle on-chain).
-- **Automatic retries**: If placement fails due to settlement lag ("not enough balance / allowance"), the monitor loop retries every 2 seconds indefinitely until it succeeds or the interval ends.
-- **Allowance refresh**: Calls `update_balance_allowance(CONDITIONAL, token_id)` before each placement attempt.
+- **Automatic retries**: If placement fails due to settlement lag, the monitor loop retries every 2 seconds until it succeeds or the interval ends.
+- **Allowance refresh**: Calls `update_balance_allowance(CONDITIONAL, token_id)` before each attempt.
+- **Balance verification**: Queries actual token balance and adjusts sell quantity to match.
 - **Partial-fill accounting**: Resting target sells can fill in chunks; each newly matched delta is booked immediately and reduces tracked `open_shares`.
 
-### Forced Exit (Safety Net)
+### 3. Forced Exit (Safety Net)
 
-If the target sell hasn't filled with **30 seconds remaining** before resolution:
+If neither the TEMA exit nor the target sell has fully closed the position with **30 seconds remaining** before resolution:
 
 1. Cancel the resting target sell (if active)
 2. Re-read target order state after cancel and book any matched delta not yet accounted for
 3. Place an aggressive market sell at `best_bid - $0.02` for remaining open shares only
 4. This is pure damage control — if we haven't hit our target by now, get out before resolution
 
-### Sell Mechanics
+### Sell Mechanics (All Paths)
 
-- Share size is **truncated** to 2 decimal places (`math.floor(shares * 100) / 100`) to prevent selling fractionally more than owned
-- All forced sells fetch the **actual CLOB bid price** (`get_price(token_id, "SELL")`) for floor pricing
+- Share size is **truncated** to 2 decimal places (`math.floor(shares * 100) / 100`) to prevent selling more than owned
+- All sells fetch the **actual CLOB bid price** (`get_price(token_id, "SELL")`) for floor pricing
 - Places an **aggressive GTC limit SELL** with a floor of `best_bid - $0.02`
 - Polls `get_order()` for up to **20 seconds** (`EXIT_ORDER_TIMEOUT`) to confirm fill
-- Forced sells can also be partially filled; realized proceeds/P&L are tracked incrementally and unresolved shares remain open
-- **Max 3 sell attempts** — if all fail, marks position as exited to prevent spam
+- Sells can be partially filled; realized proceeds/P&L are tracked incrementally
+- **Max 3 sell attempts** per exit path — prevents spam if orders keep failing
 
 ### Why This Strategy
 
 - **No percentage-based TP/SL**: Old approach capped upside (TP at 25%) or exited on noise (SL at 25%). Share price swings early in an interval don't mean much — what matters is final direction.
+- **TEMA catches real reversals**: Unlike a fixed stop loss, the TEMA cross responds to actual trend changes in the underlying, not share price noise.
 - **Fixed target at $0.95**: Lets winners run close to their maximum value without holding into the volatile final seconds.
-- **Time-based SL at 30s**: If we haven't hit $0.95 by the last 30 seconds, exit to limit damage rather than risk binary resolution.
+- **Time-based SL at 30s**: If we haven't exited by the last 30 seconds, sell to limit damage rather than risk binary resolution.
 
 ### Resolution After Early Exit
 
 When the interval ends:
 
-- If **already sold** (target or forced): uses realized sell P&L and logs what would've happened if held
+- If **already sold** (TEMA, target, or forced): uses realized sell P&L and logs what would've happened if held
 - If **partially sold**: carries realized P&L from sold shares, then settles only remaining `open_shares` at binary resolution
 - If **fully held**: uses binary win/lose logic on full size
 
@@ -216,17 +255,15 @@ Default: stop after **$15 cumulative loss** (`MAX_SESSION_LOSS`).
 1. **Single trade per interval**: No re-entry after early exit
 2. **REST polling for monitoring**: CLOB prices checked every 2s via REST, not WebSocket
 3. **Target price is static**: $0.95 may not be optimal for all market conditions — may need dynamic adjustment based on entry price
-4. **No per-trade stop loss**: Losers are held until forced exit at T-30s
-5. **Coinbase-calibrated, not Chainlink-calibrated**: Fair value table uses Coinbase BTC-USD data as a proxy for Chainlink (resolution oracle). Basis risk is ~0.01% ($10 at $97k)
-6. **Settlement lag is unpredictable**: Target sell placement depends on on-chain settlement speed, which varies
+4. **Coinbase-calibrated, not Chainlink-calibrated**: Fair value table uses Coinbase BTC-USD data as a proxy for Chainlink (resolution oracle). Basis risk is ~0.01% ($10 at $97k)
+5. **Settlement lag is unpredictable**: Target sell placement depends on on-chain settlement speed, which varies
+6. **Session-unaware**: No blackout for low-performance time windows (e.g., afternoon hours showed 45% win rate in paper testing)
 
 ---
 
 ## Planned Improvements
 
-See `STRATEGY_IMPROVEMENTS.md` for the full prioritized list. Key items:
-
-- **Per-trade stop loss**: Cut losers before forced exit instead of holding until T-30s
+- **Session-aware filtering**: Blackout or tighten thresholds for low-performance hours (afternoon/overnight)
 - **Dynamic target price**: Adjust based on entry price and fair value
 - **Recalibrate with Chainlink data**: Collect Chainlink ticks over time and recalibrate the table against the actual resolution oracle
 - **Dynamic position sizing**: Scale bets with edge magnitude (higher edge = larger position)
@@ -245,15 +282,21 @@ All parameters can be overridden via environment variables in Railway.
 |-----------|---------|---------|-------------|
 | Price feed | `PRICE_FEED` | chainlink | Price source: `chainlink` (resolution-matched) or `binance` (fallback) |
 
-### TEMA (Diagnostics Only)
-
-TEMA is computed and logged for post-hoc analysis but **does not gate entries**. Calibration showed zero predictive lift from TEMA alignment.
+### HTF EMA (Entry Filter)
 
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
-| Candle interval | `TREND_CANDLE_INTERVAL` | 300 (5 min) | Candle size in seconds for TEMA calculation |
-| TEMA fast period | `TREND_FAST_PERIOD` | 10 | Fast TEMA period (10 x 5min = 50 min lookback) |
-| TEMA slow period | `TREND_SLOW_PERIOD` | 80 | Slow TEMA period (80 x 5min = 6.7 hr lookback) |
+| EMA period | — | 5 | EMA period on 15-minute candles |
+| Bootstrap | — | Binance | Historical 15-min candles fetched on startup |
+
+### TEMA (Dynamic Exit)
+
+| Parameter | Env Var | Default | Description |
+|-----------|---------|---------|-------------|
+| Candle interval | — | 60 (1 min) | Candle size in seconds for exit TEMA |
+| TEMA fast period | — | 5 | Fast TEMA period |
+| TEMA slow period | — | 12 | Slow TEMA period |
+| Bootstrap | — | Binance | Historical 1-min candles fetched on startup |
 
 ### Entry Parameters
 
@@ -271,9 +314,11 @@ TEMA is computed and logged for post-hoc analysis but **does not gate entries**.
 
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
-| Target price | `EXIT_TARGET_PRICE` | 0.95 | Resting GTC sell price (primary exit) |
+| Target price | `EXIT_TARGET_PRICE` | 0.95 | Resting GTC sell price (profit taking) |
 | Forced exit | `EXIT_BEFORE_END` | 30s | Force sell with this many seconds remaining |
 | Monitor interval | `MONITOR_INTERVAL` | 2s | How often to check position and try target sell placement |
+| TEMA exit start | `EXIT_MONITOR_START` | 600s | Seconds into interval before TEMA exit becomes active |
+| TEMA cushion | `EXIT_CUSHION_PCT` | 0.05% | Skip TEMA exit if winning by more than this vs open |
 | Entry order timeout | `ENTRY_ORDER_TIMEOUT` | 20s | Seconds to wait for buy fill before cancelling |
 | Exit order timeout | `EXIT_ORDER_TIMEOUT` | 20s | Seconds to wait for sell fill before cancelling |
 

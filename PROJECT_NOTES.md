@@ -121,6 +121,10 @@
 52. **First interval skip** — both `live_trader.py` and `entry_observer.py` now skip the first (partial) interval after startup. Open price from mid-interval connection is unreliable.
 53. **Paper testing results** — 59 trades over 16 hours (2/17 6 PM - 2/18 10 AM ET): 42W/17L (71.2%). Evening session (6 PM-12 AM): 86.4%. Average win +0.158% vs average loss -0.084% (1.88x win/loss ratio). TEMA exits saved several trades that would have been losses if held.
 
+## Changes (2026-02-19)
+54. **Fee-adjusted sell quantities** — Polymarket (or Polygon gas layer) deducts fees from acquired shares, so actual on-chain balance is slightly less than the fill reports (e.g., bought 8.30, received 8.17). This caused persistent "not enough balance" errors on target sell placement. Added `_get_token_balance()` helper that queries `get_balance_allowance(CONDITIONAL, token_id)` for the real balance. Both `_try_place_target_sell` and `_sell_position` now query actual balance and adjust `open_shares` downward before placing sell orders.
+55. **STRATEGY.md updated to v5** — comprehensive rewrite covering HTF EMA entry filter, three-tier exit logic (TEMA dynamic exit -> target sell -> forced exit), fee-adjusted share tracking, first interval skip, and full configuration reference.
+
 ## Next Steps
 - Monitor live performance on Railway
 - Session-aware filtering — afternoon (12-5 PM ET) showed 45% win rate in paper testing, consider blackout or tighter thresholds

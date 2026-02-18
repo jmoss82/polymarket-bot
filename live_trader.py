@@ -971,19 +971,36 @@ class LiveTrader:
             return float(price.get("price", 0))
         return float(price)
 
+    async def _get_token_balance(self, token_id):
+        """Get actual on-chain token balance from the CLOB's view.
+        Polymarket uses 6-decimal representation (like USDC)."""
+        try:
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(
+                None, lambda: self.clob.get_balance_allowance(
+                    BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
+                )
+            )
+            if isinstance(result, dict):
+                raw = result.get("balance", "0")
+            else:
+                raw = getattr(result, "balance", "0")
+            raw_float = float(raw)
+            bal = raw_float / 1e6 if raw_float > 1000 else raw_float
+            print(f"  [BAL] Token balance: raw={raw} -> {bal:.4f} shares", flush=True)
+            return bal
+        except Exception as e:
+            print(f"  [BAL] Balance query failed: {e}", flush=True)
+            return None
+
     async def _try_place_target_sell(self, iv):
         """Try once to place a resting GTC sell at the target price.
         Non-blocking — called from _monitor_position on each cycle.
         Returns True if placed successfully, False otherwise."""
         trade = iv.trade
         token_id = trade["token_id"]
-        shares = math.floor(float(trade.get("open_shares", trade["shares"])) * 100) / 100
+        tracked_shares = float(trade.get("open_shares", trade["shares"]))
         target_price = self.exit_target_price
-
-        order_value = shares * target_price
-        if order_value < 1.0:
-            print(f"  [TARGET] Order value ${order_value:.2f} < $1 min — cannot place target sell", flush=True)
-            return False
 
         # Refresh allowance so the CLOB knows we have the tokens
         try:
@@ -995,6 +1012,22 @@ class LiveTrader:
             )
         except Exception as e:
             print(f"  [TARGET] Allowance refresh failed: {e}", flush=True)
+
+        # Query actual balance — fees reduce shares received vs order fill size
+        actual_balance = await self._get_token_balance(token_id)
+        if actual_balance is not None and actual_balance > 0:
+            if actual_balance < tracked_shares:
+                print(f"  [TARGET] Fee adjustment: tracked {tracked_shares:.2f} -> actual {actual_balance:.2f} shares", flush=True)
+                trade["open_shares"] = actual_balance
+                trade["shares"] = actual_balance
+            shares = math.floor(actual_balance * 100) / 100
+        else:
+            shares = math.floor(tracked_shares * 100) / 100
+
+        order_value = shares * target_price
+        if order_value < 1.0:
+            print(f"  [TARGET] Order value ${order_value:.2f} < $1 min — cannot place target sell", flush=True)
+            return False
 
         try:
             order_args = OrderArgs(
@@ -1021,11 +1054,8 @@ class LiveTrader:
                 order_id = str(result) if result else None
 
             if error_msg:
-                if "not enough balance" in str(error_msg).lower():
-                    secs = time.time() - trade["ts"]
-                    print(f"  [TARGET] Settlement pending ({secs:.0f}s since fill) — will retry", flush=True)
-                else:
-                    print(f"  [TARGET] GTC SELL rejected: {error_msg}", flush=True)
+                secs = time.time() - trade["ts"]
+                print(f"  [TARGET] GTC SELL rejected ({secs:.0f}s since fill): {error_msg}", flush=True)
                 return False
 
             if order_id:
@@ -1042,11 +1072,8 @@ class LiveTrader:
             return False
 
         except Exception as e:
-            if "not enough balance" in str(e).lower():
-                secs = time.time() - trade["ts"]
-                print(f"  [TARGET] Settlement pending ({secs:.0f}s since fill) — will retry", flush=True)
-            else:
-                print(f"  [TARGET] Failed: {e}", flush=True)
+            secs = time.time() - trade["ts"]
+            print(f"  [TARGET] Failed ({secs:.0f}s since fill): {e}", flush=True)
             return False
 
     async def _monitor_position(self, iv):
@@ -1246,11 +1273,8 @@ class LiveTrader:
         trade = iv.trade
         token_id = trade["token_id"]
         open_shares = float(trade.get("open_shares", trade.get("shares", 0.0)))
-        shares = math.floor(open_shares * 100) / 100  # truncate to 2 decimals — never round up
 
         # Refresh CLOB's view of our conditional token balance/allowance before selling.
-        # Without this, the CLOB may reject the sell with "not enough balance / allowance"
-        # because its cache doesn't reflect tokens received from a recent buy.
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(
@@ -1260,6 +1284,16 @@ class LiveTrader:
             )
         except Exception as e:
             print(f"  [SELL] Allowance refresh failed (continuing): {e}", flush=True)
+
+        # Query actual balance — fees reduce shares received vs order fill size
+        actual_balance = await self._get_token_balance(token_id)
+        if actual_balance is not None and actual_balance > 0:
+            if actual_balance < open_shares:
+                print(f"  [SELL] Fee adjustment: tracked {open_shares:.2f} -> actual {actual_balance:.2f} shares", flush=True)
+                trade["open_shares"] = actual_balance
+                open_shares = actual_balance
+
+        shares = math.floor(open_shares * 100) / 100
 
         # Get current bid price for PnL estimation and floor price
         if sell_price is None:
