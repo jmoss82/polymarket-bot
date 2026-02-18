@@ -1540,8 +1540,9 @@ class LiveTrader:
             print("[WARN] HTF EMA bootstrap failed -- filter will allow all entries until ready", flush=True)
         else:
             htf_d = self.htf_ema.get_detail()
+            htf_dir = "Up" if htf_d['price'] and htf_d['ema_value'] and htf_d['price'] > htf_d['ema_value'] else "Down"
             print(f"HTF EMA({self.htf_ema.ema_period}) on {self.htf_ema.candle_interval // 60}m: "
-                  f"${htf_d['ema_value']:,.2f} | price ${htf_d['price']:,.2f} | {htf_d['direction']}", flush=True)
+                  f"${htf_d['ema_value']:,.2f} | price ${htf_d['price']:,.2f} | {htf_dir}", flush=True)
 
         ok = await self.exit_tema.bootstrap()
         if not ok:
