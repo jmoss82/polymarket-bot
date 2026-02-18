@@ -9,13 +9,21 @@
 - Region: EU West (Netherlands)
 - Auto-deploys on each commit to `main`
 
-## Current Focus
-- **TEMA trend filter** — TEMA(10)/TEMA(80) on 5-min candles, bootstrapped from Binance US, updated live from Chainlink. Only enters trades where signal direction matches trend direction.
+## Current Focus (v5)
+- **Calibrated fair value table** — entry decisions driven by a 4x4 lookup table (move_size x elapsed_time -> win rate), generated from 90 days of Coinbase BTC-USD 1-min data via `calibrate.py`. Replaces the old static STRONG/MODERATE fair values (0.70/0.75/0.85).
+- **HTF EMA(5) entry filter** — EMA(5) on 15-minute candles gates entries. Signal direction must align with the higher-timeframe trend. Bootstrapped from Binance historical data on startup.
+- **1-minute TEMA(5)/TEMA(12) dynamic exit** — after minute 10 of the interval, monitors for a TEMA crossover against the position direction. If the trend turns against us mid-trade, sells the position early. Includes:
+  - Time gate: ignores crosses before 600s into the interval (minute 10)
+  - Cushion filter: skips exit if winning by > 0.05% vs open (cross stays pending, fires if cushion erodes)
+- **First interval skip** — skips the partial first interval after startup (open price unreliable)
 - **Chainlink price feed** via Polymarket RTDS — same oracle used for market resolution
-- **Full entry/exit pipeline** — GTC limit orders, resting target sell at $0.88, forced exit at 30s remaining
+- **Three exit paths** (priority order): TEMA exit (smart stop loss) -> Target sell at $0.95 (profit taking) -> Forced exit at 30s remaining (safety net)
 - Buy pricing: `best_ask + $0.01` (aggressive GTC limit to fill quickly)
 - Sell pricing: `best_bid - $0.02` floor (aggressive GTC limit sell)
 - Edge calculated against actual buy price (`best_ask + 0.01`), not bare `best_ask`
+- Min move threshold: 0.03% — table handles signal quality
+- Max entry price: $0.95 — allows late-interval high-confidence entries
+- Entry window: 60-840s (aligned with calibration data)
 - Outcome ordering validated from Gamma API `outcomes` field (never assumed)
 - Position monitoring every 2s — checks resting sell status, places target sell after settlement
 - Circuit breaker: stops trading after $15 session loss
@@ -29,9 +37,11 @@
 - Conditional token allowances: set via Polymarket UI "Enable Trading", then `update_balance_allowance()` refreshes CLOB cache on startup and before each sell
 
 ## Key Files
-- **live_trader.py**: live trading logic, TEMA trend filter, exit management, CLOB orderbook integration
-- **trend.py**: TEMA(10/80) calculation on 5-min candles, Binance bootstrap, live candle updates
-- **entry_observer.py**: paper-mode tester — same signal + TEMA logic as live, with running W/L scoreboard
+- **live_trader.py**: live trading logic — calibrated fair values, HTF EMA entry filter, TEMA dynamic exit, CLOB orderbook integration
+- **entry_observer.py**: paper-mode signal tracker — mirrors live_trader buy-side logic with W/L scoreboard and TEMA exit simulation
+- **trend.py**: TrendTracker (TEMA on configurable candles, Binance bootstrap) + HTFEmaTracker (EMA on 15m candles)
+- **calibrate.py**: fair value calibration — fetches 90 days of Coinbase BTC-USD 1-min candles, computes win-rate table
+- **binance_rest.py**: Binance REST client for historical candle data (used by trend.py bootstrap)
 - **chainlink_ws.py**: Chainlink price feed via Polymarket RTDS WebSocket (resolution-matched)
 - **binance_ws.py**: Binance price feed (fallback, set `PRICE_FEED=binance`)
 - **set_allowances.py**: standalone script for on-chain token approvals (USDC + CTF)
@@ -92,11 +102,28 @@
 37. **Partial-fill accounting fixed end-to-end** — added `open_shares` + realized P&L/proceeds tracking. Target-sell matches are booked incrementally, forced exits sell only remaining shares, and resolution combines realized + unresolved portions correctly.
 38. **Observer tie rule fixed** — `entry_observer.py` now scores ties as **Up wins** (`close >= open`) to match Polymarket market rules and live trader logic.
 
+## Changes (2026-02-16)
+39. **Fair value calibration** — built `calibrate.py` to fetch 90 days of Coinbase BTC-USD 1-min candles (129,597 candles, 8,637 intervals, 110,149 observations) and compute empirical win rates bucketed by (move_size, elapsed_time). Produces a 4x4 lookup table embedded directly in `live_trader.py`.
+40. **TEMA filter removed** — calibration showed TEMA alignment provides zero predictive lift (78.7% vs 79.0%). TEMA still runs and logs for post-hoc analysis but no longer gates entries. `entry_observer.py` updated to match.
+41. **Static fair values replaced** — old STRONG/MODERATE classification (0.70/0.75/0.85) replaced with calibrated table lookup. Key finding: the old values were undervaluing late-interval entries by up to 16.5% and overvaluing early strong signals by 7.1%.
+42. **Min move lowered to 0.03%** — the 0.03-0.05% bucket shows 80% win rate at 600-840s. Previously ignored entirely.
+43. **Max entry price raised to $0.95** — allows high-confidence late entries where calibrated fair values are 0.87-0.98.
+44. **Target sell raised to $0.95** — from $0.88. Lets winners run closer to maximum value instead of capping upside.
+45. **Entry window adjusted** — starts at 60s (from 45s) to align with calibration data boundaries.
+46. **Paper test validated** — entry observer ran 4 intervals with new logic: 3W/1L (75%). Both 0.03-0.05% entries won. The loss was an early low-conviction entry (fair 65.5%) that reversed — expected at that win rate.
+
+## Changes (2026-02-17 / 2026-02-18)
+47. **HTF EMA entry filter** — added `HTFEmaTracker` to `trend.py`. EMA(5) on 15-minute candles, bootstrapped from Binance. Blocks entries where signal direction conflicts with the higher-timeframe trend. Paper testing showed meaningful improvement in win rate.
+48. **1-minute TEMA dynamic exit** — after minute 10 of the interval, monitors TEMA(5)/TEMA(12) on 1-minute candles for a crossover against the position direction. Triggers early sell when the story changes mid-trade.
+49. **Time gate for TEMA exit** — `EXIT_MONITOR_START = 600` (configurable via env). Crosses before minute 10 are ignored as noise.
+50. **Cushion filter for TEMA exit** — `EXIT_CUSHION_PCT = 0.05` (configurable). If winning by > 0.05% vs open when a cross occurs, the exit is skipped but the cross stays pending. If the cushion erodes below threshold, the exit fires. Prevents premature profit-taking on strong winners.
+51. **Cushion skip bug fix** — initial implementation updated `prev_exit_tema` even after a cushion skip, consuming the cross permanently. Fixed so the cross stays pending until either the cushion erodes (fires exit) or a favorable cross occurs (resets state).
+52. **First interval skip** — both `live_trader.py` and `entry_observer.py` now skip the first (partial) interval after startup. Open price from mid-interval connection is unreliable.
+53. **Paper testing results** — 59 trades over 16 hours (2/17 6 PM - 2/18 10 AM ET): 42W/17L (71.2%). Evening session (6 PM-12 AM): 86.4%. Average win +0.158% vs average loss -0.084% (1.88x win/loss ratio). TEMA exits saved several trades that would have been losses if held.
+
 ## Next Steps
-- Observe live trades with new exit strategy (target sell @ $0.88 + forced exit @ 30s)
-- Evaluate target price ($0.88) — may need tuning based on actual fill rates
-- Redesign entry logic to use trend direction proactively (enter on discount, not confirmation)
-- Add reach ratio / volatility-based entry filtering (ATR + distance to PTB)
-- Volume-based indicators for conviction (CVD, RVOL, or VWAP)
-- Consider multi-timeframe TEMA (1-min for timing, 5-min for direction)
-- Dead zone for TEMA crossovers (minimum gap threshold before declaring trend)
+- Monitor live performance on Railway
+- Session-aware filtering — afternoon (12-5 PM ET) showed 45% win rate in paper testing, consider blackout or tighter thresholds
+- Dynamic position sizing — scale bets with edge magnitude
+- Recalibrate fair values periodically with fresh data
+- Collect Chainlink ticks for ground-truth recalibration

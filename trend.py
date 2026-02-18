@@ -228,6 +228,134 @@ class TrendTracker:
         }
 
 
+# ── HTF EMA Tracker ──────────────────────────────────────────
+
+HTF_CANDLE_INTERVAL = int(os.getenv("HTF_CANDLE_INTERVAL", "900"))   # 15 minutes
+HTF_EMA_PERIOD = int(os.getenv("HTF_EMA_PERIOD", "5"))
+
+
+class HTFEmaTracker:
+    """EMA on higher-timeframe candles for directional confirmation.
+
+    Bootstraps from Binance historical candles, then updates live from
+    Chainlink ticks as each candle closes.
+
+    Usage:
+        htf = HTFEmaTracker(candle_interval=900, ema_period=5)
+        await htf.bootstrap()
+        htf.update_price(price, ts_ms)
+        aligned = htf.is_aligned("Up")   # True if price > EMA
+    """
+
+    def __init__(self, candle_interval=None, ema_period=None):
+        self.candle_interval = candle_interval or HTF_CANDLE_INTERVAL
+        self.ema_period = ema_period or HTF_EMA_PERIOD
+        self._min_candles = self.ema_period + 10
+        self._closes = deque(maxlen=self._min_candles + 50)
+
+        self._current_candle_start = 0
+        self._current_candle_close = None
+        self.ema_value = None
+        self._ready = False
+
+    def _get_candle_start(self, ts_seconds=None):
+        ts = ts_seconds or time.time()
+        return int(ts // self.candle_interval) * self.candle_interval
+
+    async def bootstrap(self):
+        """Fetch historical candles from Binance to seed EMA."""
+        interval_str = _BINANCE_INTERVALS.get(self.candle_interval, "15m")
+        limit = min(self._min_candles + 10, 1000)
+
+        print(f"[HTF-EMA] Fetching {limit} x {interval_str} candles from Binance...", flush=True)
+
+        for base_url in BINANCE_KLINES_URLS:
+            url = f"{base_url}?symbol=BTCUSDT&interval={interval_str}&limit={limit}"
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                        if resp.status != 200:
+                            print(f"[HTF-EMA] {base_url} returned {resp.status}, trying next...", flush=True)
+                            continue
+
+                        data = await resp.json()
+                        if not data or len(data) < self.ema_period:
+                            print(f"[HTF-EMA] Not enough candles: got {len(data)}, need {self.ema_period}", flush=True)
+                            return False
+
+                        for candle in data[:-1]:
+                            self._closes.append(float(candle[4]))
+
+                        self._current_candle_start = int(data[-1][0]) // 1000
+                        self._current_candle_close = float(data[-1][4])
+
+                        self._recalc()
+                        status = "READY" if self._ready else "WARMING UP"
+                        print(f"[HTF-EMA] Loaded {len(self._closes)} candles | {status}", flush=True)
+                        if self._ready:
+                            print(f"[HTF-EMA] EMA({self.ema_period}) = ${self.ema_value:,.2f} | "
+                                  f"Price = ${self._current_candle_close:,.2f} | "
+                                  f"Direction: {'Up' if self._current_candle_close > self.ema_value else 'Down'}",
+                                  flush=True)
+                        return True
+
+            except Exception as e:
+                print(f"[HTF-EMA] {base_url} failed: {e}", flush=True)
+                continue
+
+        print(f"[HTF-EMA] All Binance endpoints failed", flush=True)
+        return False
+
+    def update_price(self, price, ts_ms=None):
+        """Feed every Chainlink tick. Closes candles and recomputes EMA."""
+        ts_sec = (ts_ms / 1000.0) if ts_ms else time.time()
+        candle_start = self._get_candle_start(ts_sec)
+
+        if self._current_candle_start == 0:
+            self._current_candle_start = candle_start
+            self._current_candle_close = price
+            return
+
+        if candle_start > self._current_candle_start:
+            if self._current_candle_close is not None:
+                self._closes.append(self._current_candle_close)
+                self._recalc()
+            self._current_candle_start = candle_start
+            self._current_candle_close = price
+        else:
+            self._current_candle_close = price
+
+    def _recalc(self):
+        closes = list(self._closes)
+        ema_series = _calc_ema(closes, self.ema_period)
+        self.ema_value = ema_series[-1] if ema_series and ema_series[-1] is not None else None
+        self._ready = self.ema_value is not None
+
+    def is_aligned(self, direction):
+        """Check if current price action aligns with the given direction.
+
+        Returns True if:
+          - direction == "Up"   and latest close > EMA
+          - direction == "Down" and latest close < EMA
+        Returns None if not ready.
+        """
+        if not self._ready or self._current_candle_close is None:
+            return None
+        if direction == "Up":
+            return self._current_candle_close > self.ema_value
+        elif direction == "Down":
+            return self._current_candle_close < self.ema_value
+        return None
+
+    def get_detail(self):
+        return {
+            "ema_value": round(self.ema_value, 2) if self.ema_value else None,
+            "price": round(self._current_candle_close, 2) if self._current_candle_close else None,
+            "ready": self._ready,
+            "candles": len(self._closes),
+        }
+
+
 # ── Standalone test ─────────────────────────────────────────
 if __name__ == "__main__":
     import asyncio
