@@ -447,7 +447,7 @@ class LiveTrader:
                 ed = self.exit_tema.get_detail()
                 tema_str = f" | TEMA(5/12)={ed['trend']}" if ed['ready'] else ""
                 htf_str = f" | HTF: EMA(5)=${htf_d['ema_value']:,.2f}" if htf_d['ready'] else ""
-                print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | ${self.bankroll:.2f} | {len(self.trades)} trades{tema_str}{htf_str} ---")
+                print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | ${self.bankroll:.2f} | {len(self.trades)} trades{tema_str}{htf_str} ---", flush=True)
                 log_event("interval_start", {"slug": self.current_interval.slug, "bankroll": self.bankroll})
 
             if prev and prev.trade:
@@ -458,7 +458,7 @@ class LiveTrader:
             await self._on_trade_inner(symbol, price, exchange_ts, local_ts)
         except Exception as e:
             log_event("error", {"context": "on_trade", "error": str(e)})
-            print(f"  [ERR] {e}")
+            print(f"  [ERR] {e}", flush=True)
 
     async def _on_trade_inner(self, symbol, price, exchange_ts, local_ts):
         # Update indicators with every price tick
@@ -499,7 +499,7 @@ class LiveTrader:
             else:
                 tag = ""
             trend_tag = f" | TEMA={self.exit_tema.get_trend()}"
-            print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}{trend_tag}")
+            print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}{trend_tag}", flush=True)
 
         # Monitor open position for TP/SL/forced exit
         if iv.trade_taken and iv.trade and not iv.exited:
@@ -710,7 +710,7 @@ class LiveTrader:
 
         except Exception as e:
             log_event("error", {"context": "evaluate", "error": str(e)})
-            print(f"  [ERR evaluate] {e}")
+            print(f"  [ERR evaluate] {e}", flush=True)
 
     async def _place_order(self, token_id, price, amount):
         """Place a GTC limit buy order. Returns order_id or None."""
@@ -773,7 +773,7 @@ class LiveTrader:
 
         except Exception as e:
             log_event("order_error", {"error": str(e), "token_id": token_id})
-            print(f"  [ORDER ERROR] {e}")
+            print(f"  [ORDER ERROR] {e}", flush=True)
             return None
 
     async def _confirm_fill(self, order_id, max_wait=20.0):
@@ -1091,7 +1091,10 @@ class LiveTrader:
         trade = iv.trade
 
         # ── TEMA dynamic exit (checked every tick, not throttled) ──
-        if not iv.tema_exit_pending and iv.elapsed >= EXIT_MONITOR_START:
+        # Don't initiate a TEMA exit within the last EXIT_BEFORE_END+30s —
+        # too late for a sell+confirm cycle; forced exit at T-30s handles it.
+        tema_cutoff = self.exit_before_end + 30
+        if not iv.tema_exit_pending and iv.elapsed >= EXIT_MONITOR_START and iv.remaining > tema_cutoff:
             exit_trend = self.exit_tema.get_trend()
             entry_dir = trade["side"]
             prev_tema = trade.get("prev_exit_tema")
@@ -1505,7 +1508,7 @@ class LiveTrader:
                 would_have_won = trade["side"] == winner
                 result = "WIN" if won else "LOSS"
                 held_result = "would've WON" if would_have_won else "would've LOST"
-                print(f"  << {result} ({iv.exit_reason}) | P&L ${pnl:+.2f} | {held_result} if held | Bank ${self.bankroll:.2f}")
+                print(f"  << {result} ({iv.exit_reason}) | P&L ${pnl:+.2f} | {held_result} if held | Bank ${self.bankroll:.2f}", flush=True)
             else:
                 # Held to resolution. Include realized partial exits, then settle
                 # remaining shares at binary resolution.
@@ -1527,7 +1530,7 @@ class LiveTrader:
                 trade["exit_type"] = "resolution"
 
                 result = "WIN" if won else "LOSS"
-                print(f"  << {result} | {trade['side']} | BTC {trade['final_move']:+.3f}% | P&L ${pnl:+.2f} | Bank ${self.bankroll:.2f} | {sum(1 for t in self.trades if t.get('won'))}/{len(self.trades)}")
+                print(f"  << {result} | {trade['side']} | BTC {trade['final_move']:+.3f}% | P&L ${pnl:+.2f} | Bank ${self.bankroll:.2f} | {sum(1 for t in self.trades if t.get('won'))}/{len(self.trades)}", flush=True)
 
             trade["bankroll_after"] = round(self.bankroll, 2)
             self.trades.append(trade)
@@ -1555,6 +1558,7 @@ class LiveTrader:
 
         except Exception as e:
             log_event("error", {"context": "resolve", "error": str(e)})
+            print(f"  [ERR resolve] {e}", flush=True)
 
     async def _fetch_market(self, slug):
         url = f"{GAMMA_API}/markets"
