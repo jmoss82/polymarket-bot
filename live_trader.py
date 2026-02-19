@@ -272,7 +272,6 @@ class LiveTrader:
         else:
             self.feed = ChainlinkFeed(symbols=["BTC"], on_trade=self._on_trade)
             self._feed_name = "Chainlink"
-        self.trend = TrendTracker()
         self.htf_ema = HTFEmaTracker()
         self.exit_tema = TrendTracker(candle_interval=60, fast_period=5, slow_period=12)
         self._http = None
@@ -444,11 +443,11 @@ class LiveTrader:
                 self.current_interval.skipped = True
                 print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | SKIPPING (partial first interval) ---", flush=True)
             else:
-                td = self.trend.get_detail()
                 htf_d = self.htf_ema.get_detail()
-                trend_str = f" | trend={td['trend']}" if td['ready'] else ""
+                ed = self.exit_tema.get_detail()
+                tema_str = f" | TEMA(5/12)={ed['trend']}" if ed['ready'] else ""
                 htf_str = f" | HTF: EMA(5)=${htf_d['ema_value']:,.2f}" if htf_d['ready'] else ""
-                print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | ${self.bankroll:.2f} | {len(self.trades)} trades{trend_str}{htf_str} ---")
+                print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | ${self.bankroll:.2f} | {len(self.trades)} trades{tema_str}{htf_str} ---")
                 log_event("interval_start", {"slug": self.current_interval.slug, "bankroll": self.bankroll})
 
             if prev and prev.trade:
@@ -463,7 +462,6 @@ class LiveTrader:
 
     async def _on_trade_inner(self, symbol, price, exchange_ts, local_ts):
         # Update indicators with every price tick
-        self.trend.update_price(price, exchange_ts)
         self.htf_ema.update_price(price, exchange_ts)
         self.exit_tema.update_price(price, exchange_ts)
 
@@ -500,7 +498,7 @@ class LiveTrader:
                 tag = " [no fill]"
             else:
                 tag = ""
-            trend_tag = f" | trend={self.trend.get_trend()}"
+            trend_tag = f" | TEMA={self.exit_tema.get_trend()}"
             print(f"  {iv.move_pct:+.3f}% | ${price:,.0f} | {iv.remaining:.0f}s left{tag}{trend_tag}")
 
         # Monitor open position for TP/SL/forced exit
@@ -666,8 +664,8 @@ class LiveTrader:
             # Use actual fill data for position tracking
             actual_cost = round(filled_size * fill_price, 4)
 
-            entry_trend = self.trend.get_detail()
             htf_d = self.htf_ema.get_detail()
+            entry_tema = self.exit_tema.get_detail()
             exit_tema_trend = self.exit_tema.get_trend()
 
             iv.trade = {
@@ -693,9 +691,9 @@ class LiveTrader:
                 "token_id": token_id,
                 "order_id": order_id,
                 "ts": time.time(),
-                "trend": entry_trend["trend"],
-                "tema_fast": entry_trend["tema_fast"],
-                "tema_slow": entry_trend["tema_slow"],
+                "trend": entry_tema["trend"],
+                "tema_fast": entry_tema["tema_fast"],
+                "tema_slow": entry_tema["tema_slow"],
                 "htf_ema": htf_d.get("ema_value"),
                 "prev_exit_tema": exit_tema_trend if exit_tema_trend != "Neutral" else None,
                 "realized_proceeds": 0.0,
@@ -1600,14 +1598,6 @@ class LiveTrader:
         self._log_balance()
 
         # Bootstrap indicators
-        ok = await self.trend.bootstrap()
-        if not ok:
-            print("[WARN] TEMA bootstrap failed -- trend data unavailable for logging", flush=True)
-        else:
-            td = self.trend.get_detail()
-            print(f"TEMA (diagnostics): TEMA({self.trend.fast_period}/{self.trend.slow_period}) on "
-                  f"{self.trend.candle_interval // 60}min candles | {td['trend']}", flush=True)
-
         ok = await self.htf_ema.bootstrap()
         if not ok:
             print("[WARN] HTF EMA bootstrap failed -- filter will allow all entries until ready", flush=True)
