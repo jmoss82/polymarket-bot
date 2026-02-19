@@ -133,6 +133,10 @@
 60. **`asyncio.get_event_loop()` deprecated** — replaced with `asyncio.get_running_loop()` in all 13 async call sites (Python 3.10+ deprecation).
 61. **Minor fixes** — `last_htf_log_minute` split from `last_log_minute` so below-threshold and HTF filter logs throttle independently; `price_down` unused variable removed from `_evaluate`; `_get_clob_midpoint` wrapped in try/except; CSV `bankroll` column now stamps `bankroll_after` at resolve time instead of always showing current session value.
 
+62. **Dust shares threshold** — truncation gap between fee-adjusted balance and sell order size left unsellable dust (e.g., 0.0061 shares). Bot thought position was still open, triggered forced exit, scored profitable target fills as $0 losses. Added `DUST_THRESHOLD = 0.01` to all open_shares checks. Below-min sells now use realized P&L.
+63. **Missing log output on Railway** — interval banner, resolution lines, status, and error prints were missing `flush=True`. Railway buffers stdout, so these critical lines were swallowed. Also added visible `[ERR resolve]` print to `_resolve` exception handler (previously only wrote to jsonl silently).
+64. **TEMA exit cutoff at T-60s** — TEMA exit that fired at 59s remaining caused a 90s API hang during fill confirmation, blowing past the interval boundary. New cutoff: `remaining > EXIT_BEFORE_END + 30` (60s). If only 60s remain, the forced exit at T-30s handles it instead.
+
 ## Next Steps
 - Monitor live performance on Railway
 - Session-aware filtering — afternoon (12-5 PM ET) showed 45% win rate in paper testing, consider blackout or tighter thresholds
