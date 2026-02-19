@@ -1154,7 +1154,7 @@ class LiveTrader:
                                 print(f"  [TEMA] Cancel resting sell failed: {e}", flush=True)
                             iv.tp_order_id = None
 
-                        if float(trade.get("open_shares", trade.get("shares", 0.0))) >= DUST_THRESHOLD:
+                        if float(trade.get("open_shares", trade.get("shares", 0.0))) > DUST_THRESHOLD:
                             await self._sell_position(iv, reason="tema_exit")
                         else:
                             iv.exited = True
@@ -1192,7 +1192,7 @@ class LiveTrader:
                 iv.tp_order_id = None
 
             remaining_shares = float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0)))
-            if remaining_shares < DUST_THRESHOLD:
+            if remaining_shares <= DUST_THRESHOLD:
                 iv.exited = True
                 iv.exit_reason = "target_fill"
                 iv.exit_pnl = round(float(iv.trade.get("realized_pnl", 0.0)), 2)
@@ -1214,7 +1214,7 @@ class LiveTrader:
             # TEMA exit retry — sell signaled but previous attempt failed; retry every monitor cycle
             if iv.tema_exit_pending and not iv.exited:
                 remaining_shares = float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0)))
-                if remaining_shares >= DUST_THRESHOLD:
+                if remaining_shares > DUST_THRESHOLD:
                     print(f"  [TEMA] Retrying exit sell (attempt {iv.tema_sell_attempts + 1})", flush=True)
                     await self._sell_position(iv, reason="tema_exit")
                 return
@@ -1242,8 +1242,25 @@ class LiveTrader:
                     if size_matched > 0:
                         self._apply_target_match_delta(iv, size_matched, raw_avg)
 
-                    # Consider target exit complete once open shares are below dust threshold.
-                    if float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0))) < DUST_THRESHOLD:
+                    # Fallback: CLOB sometimes reports size_matched=0 for filled orders.
+                    # If open_shares is still high, check actual token balance to detect fills.
+                    open_shares_now = float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0)))
+                    if open_shares_now > DUST_THRESHOLD and status in ("MATCHED", "matched"):
+                        actual_bal = await self._get_token_balance(token_id)
+                        if actual_bal is not None and actual_bal <= DUST_THRESHOLD:
+                            filled_shares = open_shares_now - actual_bal
+                            proceeds = self.exit_target_price * filled_shares
+                            pnl_delta = (self.exit_target_price - entry_price) * filled_shares
+                            iv.trade["open_shares"] = actual_bal
+                            iv.trade["realized_proceeds"] = float(iv.trade.get("realized_proceeds", 0.0)) + proceeds
+                            iv.trade["realized_pnl"] = float(iv.trade.get("realized_pnl", 0.0)) + pnl_delta
+                            self.bankroll += round(proceeds, 2)
+                            save_state(self.trades, self.bankroll)
+                            print(f"  [TARGET] Balance fallback: {filled_shares:.2f} shares sold @ {self.exit_target_price} (balance={actual_bal:.4f})", flush=True)
+                            open_shares_now = actual_bal
+
+                    # Consider target exit complete once open shares are at/below dust threshold.
+                    if open_shares_now <= DUST_THRESHOLD:
                         iv.exited = True
                         iv.exit_reason = "target_fill"
                         iv.exit_price = self.exit_target_price
