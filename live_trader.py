@@ -180,7 +180,7 @@ def _write_csv(trades, bankroll):
                 f"{t.get('final_move', 0):+.3f}%" if t.get("final_move") is not None else "",
                 "WIN" if t.get("won") else "LOSS" if t.get("won") is not None else "OPEN",
                 f"${t.get('pnl', 0):+.2f}" if t.get("pnl") is not None else "",
-                f"${bankroll:.2f}",
+                f"${t.get('bankroll_after', bankroll):.2f}",
                 t.get("order_id", ""),
             ])
 
@@ -222,16 +222,20 @@ class IntervalState:
         self.trade_taken = False
         self.trade = None
         self.last_log_minute = -1       # throttle below-threshold signal logging (per minute)
+        self.last_htf_log_minute = -1   # throttle HTF filter logging (per minute)
         self.last_eval_half_min = -1    # throttle entry evaluations (per 30s)
         # Exit tracking
         self.exited = False
         self.exit_reason = None      # "target_fill", "forced_exit"
         self.exit_price = None
         self.exit_pnl = None
-        self.last_monitor_ts = 0     # throttle Polymarket price checks
-        self.sell_attempts = 0       # cap retries on failed sells
-        self.tp_order_id = None      # resting GTC sell order for target price
+        self.last_monitor_ts = 0        # throttle Polymarket price checks
+        self.tema_sell_attempts = 0     # cap retries on TEMA exit sells
+        self.forced_sell_attempts = 0   # cap retries on forced exit sells (separate budget)
+        self._sell_in_progress = False  # guard against concurrent sell attempts
+        self.tp_order_id = None         # resting GTC sell order for target price
         self.tema_exit_pending = False  # TEMA exit sell initiated
+        self.skipped = False            # True for the partial first interval
 
     @property
     def elapsed(self):
@@ -437,6 +441,7 @@ class LiveTrader:
 
             if self._first_interval:
                 self._first_interval = False
+                self.current_interval.skipped = True
                 print(f"\n--- {fmt_et_short(ts)}-{fmt_et_short(ts+900)} ET | SKIPPING (partial first interval) ---", flush=True)
             else:
                 td = self.trend.get_detail()
@@ -507,7 +512,7 @@ class LiveTrader:
             return
 
         # Signal logic — skip if first interval, already traded, or outside entry window
-        if self._first_interval:
+        if iv.skipped:
             return
         if iv.trade_taken or iv.elapsed < self.entry_window[0] or iv.elapsed > self.entry_window[1]:
             return
@@ -542,8 +547,8 @@ class LiveTrader:
         htf_aligned = self.htf_ema.is_aligned(signal)
         if htf_aligned is False:
             minute = int(iv.elapsed) // 60
-            if minute != iv.last_log_minute:
-                iv.last_log_minute = minute
+            if minute != iv.last_htf_log_minute:
+                iv.last_htf_log_minute = minute
                 htf_d = self.htf_ema.get_detail()
                 print(f"  [FILTERED] {signal} {abs_move:.4f}% @ {iv.elapsed:.0f}s -- "
                       f"HTF EMA(5)=${htf_d['ema_value']:,.2f} vs ${htf_d['price']:,.2f} misaligned",
@@ -578,7 +583,6 @@ class LiveTrader:
 
             sig_idx = outcome_map[signal]
             price_up = float(prices[outcome_map.get("Up", 0)])
-            price_down = float(prices[outcome_map.get("Down", 1)])
             token_id = clob_ids[sig_idx]
             accepting = market.get("acceptingOrders")
             min_size = market.get("orderMinSize")
@@ -685,7 +689,6 @@ class LiveTrader:
                 "elapsed": iv.elapsed,
                 "slug": iv.slug,
                 "market_up": price_up,
-                "market_down": price_down,
                 "edge": edge,
                 "token_id": token_id,
                 "order_id": order_id,
@@ -735,7 +738,7 @@ class LiveTrader:
             print(f"  [ORDER] GTC BUY token={token_id[:16]}... price={price} size={size} (~${size * price:.2f})", flush=True)
 
             # Two-step: create standard order, then post with GTC.
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             signed_order = await loop.run_in_executor(
                 None, lambda: self.clob.create_order(order_args)
             )
@@ -782,7 +785,7 @@ class LiveTrader:
             (filled_size, avg_price)
         where filled_size can be partial if the order times out/cancels.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         start = time.time()
         attempts = 0
         last_matched = 0.0
@@ -910,7 +913,7 @@ class LiveTrader:
 
     async def _get_order_book(self, token_id):
         """Get full orderbook from CLOB. Returns (best_bid, best_ask, bid_depth, ask_depth, spread) or Nones."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         try:
             book = await loop.run_in_executor(
                 None, lambda: self.clob.get_order_book(token_id)
@@ -956,18 +959,22 @@ class LiveTrader:
 
     async def _get_clob_midpoint(self, token_id):
         """Get live midpoint price from CLOB orderbook (not cached Gamma API)."""
-        loop = asyncio.get_event_loop()
-        mid = await loop.run_in_executor(
-            None, lambda: self.clob.get_midpoint(token_id)
-        )
-        # Returns string like "0.55" or a dict — handle both
-        if isinstance(mid, dict):
-            return float(mid.get("mid", 0))
-        return float(mid)
+        try:
+            loop = asyncio.get_running_loop()
+            mid = await loop.run_in_executor(
+                None, lambda: self.clob.get_midpoint(token_id)
+            )
+            # Returns string like "0.55" or a dict — handle both
+            if isinstance(mid, dict):
+                return float(mid.get("mid", 0))
+            return float(mid)
+        except Exception as e:
+            print(f"  [MID ERR] {e}", flush=True)
+            return None
 
     async def _get_clob_price(self, token_id, side="SELL"):
         """Get live bid/ask price from CLOB orderbook."""
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         price = await loop.run_in_executor(
             None, lambda: self.clob.get_price(token_id, side)
         )
@@ -979,7 +986,7 @@ class LiveTrader:
         """Get actual on-chain token balance from the CLOB's view.
         Polymarket uses 6-decimal representation (like USDC)."""
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             result = await loop.run_in_executor(
                 None, lambda: self.clob.get_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
@@ -1008,7 +1015,7 @@ class LiveTrader:
 
         # Refresh allowance so the CLOB knows we have the tokens
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None, lambda: self.clob.update_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
@@ -1041,7 +1048,7 @@ class LiveTrader:
                 side="SELL",
             )
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             signed_order = await loop.run_in_executor(
                 None, lambda: self.clob.create_order(order_args)
             )
@@ -1130,7 +1137,7 @@ class LiveTrader:
                         if iv.tp_order_id:
                             tp_id = iv.tp_order_id
                             try:
-                                loop = asyncio.get_event_loop()
+                                loop = asyncio.get_running_loop()
                                 await loop.run_in_executor(None, lambda: self.clob.cancel(tp_id))
                                 print(f"  [TEMA] Cancelled resting sell {tp_id[:16]}...", flush=True)
                                 order = await loop.run_in_executor(None, lambda: self.clob.get_order(tp_id))
@@ -1165,7 +1172,7 @@ class LiveTrader:
             if iv.tp_order_id:
                 tp_order_id = iv.tp_order_id
                 try:
-                    loop = asyncio.get_event_loop()
+                    loop = asyncio.get_running_loop()
                     await loop.run_in_executor(None, lambda: self.clob.cancel(tp_order_id))
                     print(f"  [EXIT] Cancelled resting sell {tp_order_id[:16]}...", flush=True)
 
@@ -1203,13 +1210,21 @@ class LiveTrader:
             token_id = iv.trade["token_id"]
             entry_price = iv.trade["entry_price"]
 
+            # TEMA exit retry — sell signaled but previous attempt failed; retry every monitor cycle
+            if iv.tema_exit_pending and not iv.exited:
+                remaining_shares = float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0)))
+                if remaining_shares >= DUST_THRESHOLD:
+                    print(f"  [TEMA] Retrying exit sell (attempt {iv.tema_sell_attempts + 1})", flush=True)
+                    await self._sell_position(iv, reason="tema_exit")
+                return
+
             # Try to place target sell if not yet placed (waits 5s after fill for settlement)
             if not iv.tp_order_id and (now - iv.trade["ts"]) >= 5:
                 await self._try_place_target_sell(iv)
 
             # Check if resting target sell has filled
             if iv.tp_order_id:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 order = await loop.run_in_executor(
                     None, lambda: self.clob.get_order(iv.tp_order_id)
                 )
@@ -1267,14 +1282,30 @@ class LiveTrader:
     async def _sell_position(self, iv, reason="manual", sell_price=None):
         """Sell the current position using an aggressive GTC limit order on the CLOB."""
         MAX_SELL_ATTEMPTS = 3
-        iv.sell_attempts += 1
-        if iv.sell_attempts > MAX_SELL_ATTEMPTS:
-            print(f"  [SELL GAVE UP] {iv.sell_attempts - 1} failed attempts — marking exited", flush=True)
-            iv.exited = True
-            iv.exit_reason = f"{reason}_failed"
-            iv.exit_pnl = 0  # unknown, couldn't sell
-            log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} attempts"})
+
+        # Guard: asyncio is single-threaded; setting this flag before any await
+        # means no other coroutine can enter _sell_position while we're awaiting below.
+        if iv._sell_in_progress:
+            print(f"  [SELL] Sell already in progress — skipping {reason}", flush=True)
             return
+        iv._sell_in_progress = True
+
+        try:
+            # Separate attempt budgets so TEMA failures don't consume forced exit retries.
+            if reason == "forced_exit":
+                iv.forced_sell_attempts += 1
+                attempts = iv.forced_sell_attempts
+            else:
+                iv.tema_sell_attempts += 1
+                attempts = iv.tema_sell_attempts
+
+            if attempts > MAX_SELL_ATTEMPTS:
+                print(f"  [SELL GAVE UP] {attempts - 1} failed {reason} attempts — marking exited", flush=True)
+                iv.exited = True
+                iv.exit_reason = f"{reason}_failed"
+                iv.exit_pnl = 0  # unknown, couldn't sell
+                log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} {reason} attempts"})
+                return
 
         trade = iv.trade
         token_id = trade["token_id"]
@@ -1282,7 +1313,7 @@ class LiveTrader:
 
         # Refresh CLOB's view of our conditional token balance/allowance before selling.
         try:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             await loop.run_in_executor(
                 None, lambda: self.clob.update_balance_allowance(
                     BalanceAllowanceParams(asset_type=AssetType.CONDITIONAL, token_id=token_id)
@@ -1342,7 +1373,7 @@ class LiveTrader:
             )
             print(f"  [SELL] GTC token={token_id[:16]}... price={floor_price} size={shares} reason={reason}", flush=True)
 
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             signed_order = await loop.run_in_executor(
                 None, lambda: self.clob.create_order(order_args)
             )
@@ -1418,6 +1449,8 @@ class LiveTrader:
         except Exception as e:
             log_event("sell_error", {"error": str(e), "reason": reason})
             print(f"  [SELL ERROR] {e}", flush=True)
+        finally:
+            iv._sell_in_progress = False
 
     async def _resolve(self, iv):
         """Resolve a completed interval's trade.
@@ -1434,7 +1467,7 @@ class LiveTrader:
         if iv.tp_order_id:
             tp_order_id = iv.tp_order_id
             try:
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, lambda: self.clob.cancel(tp_order_id))
                 print(f"  [RESOLVE] Cancelled unfilled target sell {tp_order_id[:16]}...", flush=True)
 
@@ -1498,6 +1531,7 @@ class LiveTrader:
                 result = "WIN" if won else "LOSS"
                 print(f"  << {result} | {trade['side']} | BTC {trade['final_move']:+.3f}% | P&L ${pnl:+.2f} | Bank ${self.bankroll:.2f} | {sum(1 for t in self.trades if t.get('won'))}/{len(self.trades)}")
 
+            trade["bankroll_after"] = round(self.bankroll, 2)
             self.trades.append(trade)
             save_state(self.trades, self.bankroll)
 

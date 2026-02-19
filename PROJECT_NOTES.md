@@ -125,6 +125,14 @@
 54. **Fee-adjusted sell quantities** — Polymarket (or Polygon gas layer) deducts fees from acquired shares, so actual on-chain balance is slightly less than the fill reports (e.g., bought 8.30, received 8.17). This caused persistent "not enough balance" errors on target sell placement. Added `_get_token_balance()` helper that queries `get_balance_allowance(CONDITIONAL, token_id)` for the real balance. Both `_try_place_target_sell` and `_sell_position` now query actual balance and adjust `open_shares` downward before placing sell orders.
 55. **STRATEGY.md updated to v5** — comprehensive rewrite covering HTF EMA entry filter, three-tier exit logic (TEMA dynamic exit -> target sell -> forced exit), fee-adjusted share tracking, first interval skip, and full configuration reference.
 
+## Bug Fixes & Hardening (2026-02-19)
+56. **First interval skip broken** — `_first_interval` flag was cleared inside `_rotate_interval()` before the guard in `_on_trade_inner()` could check it, so every tick in the skipped interval passed through to signal evaluation. Fixed by adding a `skipped` flag to `IntervalState` that persists for the entire duration of the first interval. Root cause confirmed by live log: bot traded during a "SKIPPING" interval and had to be manually closed.
+57. **Concurrent sell attempts possible** — while `_confirm_fill` awaited (up to 20s), new price ticks could re-enter `_monitor_position` and launch a second `_sell_position`. Fixed with a `_sell_in_progress` boolean on `IntervalState`, set before the first `await` (asyncio single-threaded cooperative model makes this atomic), cleared in `finally`.
+58. **`sell_attempts` budget shared across exit paths** — TEMA exit failures could exhaust the 3-attempt cap before forced exit ran, causing the safety net to give up immediately. Fixed by splitting into `tema_sell_attempts` and `forced_sell_attempts` with independent budgets.
+59. **TEMA exit sell failure left position unprotected** — after a failed TEMA exit sell, no retry occurred until the forced exit window (30s remaining). Fixed by adding a retry block in the throttled monitor cycle: when `tema_exit_pending` is True and the position is still open, retry `_sell_position` every 2s.
+60. **`asyncio.get_event_loop()` deprecated** — replaced with `asyncio.get_running_loop()` in all 13 async call sites (Python 3.10+ deprecation).
+61. **Minor fixes** — `last_htf_log_minute` split from `last_log_minute` so below-threshold and HTF filter logs throttle independently; `price_down` unused variable removed from `_evaluate`; `_get_clob_midpoint` wrapped in try/except; CSV `bankroll` column now stamps `bankroll_after` at resolve time instead of always showing current session value.
+
 ## Next Steps
 - Monitor live performance on Railway
 - Session-aware filtering — afternoon (12-5 PM ET) showed 45% win rate in paper testing, consider blackout or tighter thresholds

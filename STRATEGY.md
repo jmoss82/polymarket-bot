@@ -190,6 +190,9 @@ A 1-minute TEMA(5)/TEMA(12) crossover detects when the short-term trend turns ag
 2. Place an aggressive market sell at `best_bid - $0.02`
 3. Mark position as TEMA-exited
 
+**Retry behavior:**
+If the initial TEMA exit sell fails (rejected or unfilled), the position remains open and the monitor loop retries the sell every 2 seconds (`MONITOR_INTERVAL`) until it succeeds, the 3-attempt budget is exhausted, or the forced exit window opens. TEMA exit and forced exit have **separate** 3-attempt budgets so early failures don't block the safety net.
+
 ### 2. Target Price Sell (Profit Taking)
 
 Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed target price (default $0.95). This sits on the book and fills automatically if the share price reaches the target.
