@@ -1290,22 +1290,22 @@ class LiveTrader:
             return
         iv._sell_in_progress = True
 
-        try:
-            # Separate attempt budgets so TEMA failures don't consume forced exit retries.
-            if reason == "forced_exit":
-                iv.forced_sell_attempts += 1
-                attempts = iv.forced_sell_attempts
-            else:
-                iv.tema_sell_attempts += 1
-                attempts = iv.tema_sell_attempts
+        # Separate attempt budgets so TEMA failures don't consume forced exit retries.
+        if reason == "forced_exit":
+            iv.forced_sell_attempts += 1
+            attempts = iv.forced_sell_attempts
+        else:
+            iv.tema_sell_attempts += 1
+            attempts = iv.tema_sell_attempts
 
-            if attempts > MAX_SELL_ATTEMPTS:
-                print(f"  [SELL GAVE UP] {attempts - 1} failed {reason} attempts — marking exited", flush=True)
-                iv.exited = True
-                iv.exit_reason = f"{reason}_failed"
-                iv.exit_pnl = 0  # unknown, couldn't sell
-                log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} {reason} attempts"})
-                return
+        if attempts > MAX_SELL_ATTEMPTS:
+            iv._sell_in_progress = False  # reset before returning
+            print(f"  [SELL GAVE UP] {attempts - 1} failed {reason} attempts — marking exited", flush=True)
+            iv.exited = True
+            iv.exit_reason = f"{reason}_failed"
+            iv.exit_pnl = 0  # unknown, couldn't sell
+            log_event("sell_error", {"reason": reason, "error": f"gave up after {MAX_SELL_ATTEMPTS} {reason} attempts"})
+            return
 
         trade = iv.trade
         token_id = trade["token_id"]
