@@ -137,8 +137,16 @@
 63. **Missing log output on Railway** — interval banner, resolution lines, status, and error prints were missing `flush=True`. Railway buffers stdout, so these critical lines were swallowed. Also added visible `[ERR resolve]` print to `_resolve` exception handler (previously only wrote to jsonl silently).
 64. **TEMA exit cutoff at T-60s** — TEMA exit that fired at 59s remaining caused a 90s API hang during fill confirmation, blowing past the interval boundary. New cutoff: `remaining > EXIT_BEFORE_END + 30` (60s). If only 60s remain, the forced exit at T-30s handles it instead.
 
+## Bug Fixes & Hardening (2026-02-19 cont.)
+65. **`open_shares` down-only adjustment bug** — during Polygon settlement delay, token balance arrives in stages (e.g., 0 → 2 → 7 shares). `_try_place_target_sell` queried balance mid-settlement (2 shares) and permanently reduced `open_shares` to 2, even though the full 7 shares settled seconds later. When TEMA exit fired, `_sell_position` saw only 2 shares × $0.29 = $0.58 < $1 min → sell skipped. Result: 7 real shares abandoned, -$4.41 loss reported as $0.00. Fixed by making balance adjustments bidirectional in both `_try_place_target_sell` and `_sell_position` — now corrects `open_shares` upward when balance settles higher than tracked.
+66. **`[EXIT SKIP]` log spam** — cushion filter printed on every price tick during a pending TEMA cross, generating 143+ messages per interval. Added `exit_skip_logged` flag to `IntervalState`: first skip per cross event prints once, subsequent ticks are silent. Flag resets when the cross clears (TEMA trend reverts).
+67. **$0.00 P&L bug on below-min TEMA exit** — when TEMA exit couldn't sell (order value < $1) and no prior partial fills existed, the position was incorrectly marked as exited with P&L $0.00. This prevented `_resolve` from computing the true binary-resolution loss. Fixed: below-min sell with zero realized P&L and real shares remaining no longer marks the position as exited — it flows to resolution, which correctly computes the loss from `open_shares`.
+68. **Polymarket 5-share minimum pre-check** — Polymarket CLOB rejects sell orders below 5 shares with a 400 error. Bot was sending 2-share orders and getting rejected 3+ times per interval. Added `POLY_MIN_SHARES = 5` constant and pre-checks in both `_try_place_target_sell` and `_sell_position` to avoid futile API calls.
+
 ## Next Steps
 - Monitor live performance on Railway
+- TEMA exit calibration — two observed instances of TEMA cutting winners in choppy markets; consider raising cushion, adding confirmation delay, or disabling
+- Chainlink robustness — 31-minute disconnect observed; consider watchdog on price staleness (beyond existing 120s heartbeat)
 - Session-aware filtering — afternoon (12-5 PM ET) showed 45% win rate in paper testing, consider blackout or tighter thresholds
 - Dynamic position sizing — scale bets with edge magnitude
 - Recalibrate fair values periodically with fresh data

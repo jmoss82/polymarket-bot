@@ -62,6 +62,7 @@ EXIT_CUSHION_PCT = _env_float("EXIT_CUSHION_PCT", 0.05)      # don't TEMA-exit i
 # Dust threshold — truncation + fees leave unsellable fractional shares.
 # Treat anything below this as "position closed."
 DUST_THRESHOLD = 0.01
+POLY_MIN_SHARES = 5              # Polymarket rejects sell orders below this size
 
 # Risk management
 MAX_SESSION_LOSS = _env_float("MAX_SESSION_LOSS", 15.0)  # stop trading after $15 cumulative loss
@@ -235,6 +236,7 @@ class IntervalState:
         self._sell_in_progress = False  # guard against concurrent sell attempts
         self.tp_order_id = None         # resting GTC sell order for target price
         self.tema_exit_pending = False  # TEMA exit sell initiated
+        self.exit_skip_logged = False   # True after first [EXIT SKIP] for current cross (throttle spam)
         self.skipped = False            # True for the partial first interval
 
     @property
@@ -1022,13 +1024,16 @@ class LiveTrader:
         except Exception as e:
             print(f"  [TARGET] Allowance refresh failed: {e}", flush=True)
 
-        # Query actual balance — fees reduce shares received vs order fill size
+        # Query actual balance — fees reduce shares received vs order fill size.
+        # Balance can settle higher than initially observed (Polygon delay: 0 → partial → full).
         actual_balance = await self._get_token_balance(token_id)
         if actual_balance is not None and actual_balance > 0:
-            if actual_balance < tracked_shares:
-                print(f"  [TARGET] Fee adjustment: tracked {tracked_shares:.2f} -> actual {actual_balance:.2f} shares", flush=True)
+            if actual_balance != tracked_shares:
+                direction = "down" if actual_balance < tracked_shares else "up"
+                print(f"  [TARGET] Fee adjustment ({direction}): tracked {tracked_shares:.2f} -> actual {actual_balance:.2f} shares", flush=True)
                 trade["open_shares"] = actual_balance
-                trade["shares"] = actual_balance
+                if actual_balance < tracked_shares:
+                    trade["shares"] = actual_balance
             shares = math.floor(actual_balance * 100) / 100
         else:
             shares = math.floor(tracked_shares * 100) / 100
@@ -1036,6 +1041,9 @@ class LiveTrader:
         order_value = shares * target_price
         if order_value < 1.0:
             print(f"  [TARGET] Order value ${order_value:.2f} < $1 min — cannot place target sell", flush=True)
+            return False
+        if shares < POLY_MIN_SHARES:
+            print(f"  [TARGET] Size {shares:.0f} < Polymarket min {POLY_MIN_SHARES} — cannot place target sell", flush=True)
             return False
 
         try:
@@ -1114,9 +1122,11 @@ class LiveTrader:
 
                     if cushion > EXIT_CUSHION_PCT:
                         skipped_cushion = True
-                        print(f"  [EXIT SKIP] TEMA {exit_trend} cross but cushion "
-                              f"{cushion:.4f}% > {EXIT_CUSHION_PCT}% -- holding (cross stays pending)",
-                              flush=True)
+                        if not iv.exit_skip_logged:
+                            iv.exit_skip_logged = True
+                            print(f"  [EXIT SKIP] TEMA {exit_trend} cross but cushion "
+                                  f"{cushion:.4f}% > {EXIT_CUSHION_PCT}% -- holding (cross stays pending)",
+                                  flush=True)
                     else:
                         iv.tema_exit_pending = True
                         ed = self.exit_tema.get_detail()
@@ -1164,6 +1174,7 @@ class LiveTrader:
 
             if exit_trend != "Neutral" and not skipped_cushion:
                 trade["prev_exit_tema"] = exit_trend
+                iv.exit_skip_logged = False
 
         # Forced exit — sell no matter what with EXIT_BEFORE_END seconds remaining
         if iv.remaining <= self.exit_before_end:
@@ -1340,11 +1351,12 @@ class LiveTrader:
         except Exception as e:
             print(f"  [SELL] Allowance refresh failed (continuing): {e}", flush=True)
 
-        # Query actual balance — fees reduce shares received vs order fill size
+        # Query actual balance — can differ from tracked due to fees or late settlement
         actual_balance = await self._get_token_balance(token_id)
         if actual_balance is not None and actual_balance > 0:
-            if actual_balance < open_shares:
-                print(f"  [SELL] Fee adjustment: tracked {open_shares:.2f} -> actual {actual_balance:.2f} shares", flush=True)
+            if abs(actual_balance - open_shares) > 0.001:
+                direction = "down" if actual_balance < open_shares else "up"
+                print(f"  [SELL] Balance adjustment ({direction}): tracked {open_shares:.2f} -> actual {actual_balance:.2f} shares", flush=True)
                 trade["open_shares"] = actual_balance
                 open_shares = actual_balance
 
@@ -1374,11 +1386,26 @@ class LiveTrader:
         order_value = shares * floor_price
         if order_value < 1.0:
             realized_pnl = round(float(trade.get("realized_pnl", 0.0)), 2)
-            print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — dust, using realized P&L ${realized_pnl:+.2f}", flush=True)
-            log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": realized_pnl})
-            iv.exited = True
-            iv.exit_reason = "target_fill" if realized_pnl > 0 else f"{reason}_below_min"
-            iv.exit_pnl = realized_pnl
+            if realized_pnl > 0 or shares <= DUST_THRESHOLD:
+                # Prior partial fills booked profit, or truly dust — mark exited with known P&L
+                print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — dust, using realized P&L ${realized_pnl:+.2f}", flush=True)
+                log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": realized_pnl})
+                iv.exited = True
+                iv.exit_reason = "target_fill" if realized_pnl > 0 else f"{reason}_below_min"
+                iv.exit_pnl = realized_pnl
+            else:
+                # No prior fills and real shares remain — DON'T mark exited.
+                # Let resolution compute the true loss from remaining open_shares.
+                print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — "
+                      f"holding to resolution (no prior fills, {reason})", flush=True)
+                log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": 0, "held_to_resolution": True})
+            return
+
+        if shares < POLY_MIN_SHARES:
+            realized_pnl = round(float(trade.get("realized_pnl", 0.0)), 2)
+            print(f"  [SELL SKIP] Size {shares:.0f} < Polymarket min {POLY_MIN_SHARES} — "
+                  f"holding to resolution ({reason})", flush=True)
+            log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": realized_pnl, "min_size_block": True})
             return
 
         try:
