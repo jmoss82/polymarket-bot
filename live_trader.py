@@ -19,7 +19,8 @@ from binance_ws import BinanceFeed
 from chainlink_ws import ChainlinkFeed
 from trend import TrendTracker, HTFEmaTracker
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams, AssetType
+from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, BalanceAllowanceParams, AssetType, OpenOrderParams
+from py_clob_client.exceptions import PolyApiException
 from config import (
     POLY_API_KEY, POLY_API_SECRET, POLY_API_PASSPHRASE,
     POLY_PRIVATE_KEY, POLY_FUNDER, CHAIN_ID, CLOB_HOST,
@@ -648,20 +649,29 @@ class LiveTrader:
             print(f"  [BOOK] token={token_id[:16]}... bid {best_bid:.3f} / ask {best_ask:.3f} | spread {spread:.3f} | depth ${bid_depth:.0f}/${ask_depth:.0f}", flush=True)
             order_id = await self._place_order(token_id, buy_price, self.bet_size)
 
-            if not order_id:
+            if order_id == "UNCERTAIN":
+                # Network error — request sent but no response received. Order may
+                # have landed. Lock out new entries immediately while we probe.
+                iv.trade_taken = True
+                filled_size, fill_price, order_id = await self._recover_position(token_id, buy_price)
+                if filled_size <= 0:
+                    iv.trade_taken = False  # Nothing found — allow retry next tick
+                    log_event("order_error_retry", {"token_id": token_id, "reason": "network_error_no_position"})
+                    return
+            elif not order_id:
                 log_event("order_error_retry", {"token_id": token_id, "reason": "no_order_id"})
                 return
+            else:
+                # Order was accepted — now we're committed. Mark trade_taken to
+                # prevent duplicate orders while we wait for fill confirmation.
+                iv.trade_taken = True
 
-            # Order was accepted — now we're committed. Mark trade_taken to
-            # prevent duplicate orders while we wait for fill confirmation.
-            iv.trade_taken = True
-
-            # Confirm fill — poll order status (don't assume filled just because we got an orderID)
-            filled_size, fill_price = await self._confirm_fill(order_id, max_wait=self.entry_order_timeout)
-            if filled_size <= 0:
-                print(f"  [SKIP] Order {order_id[:16]}... not filled — no position", flush=True)
-                log_event("order_unfilled", {"order_id": order_id, "token_id": token_id})
-                return
+                # Confirm fill — poll order status (don't assume filled just because we got an orderID)
+                filled_size, fill_price = await self._confirm_fill(order_id, max_wait=self.entry_order_timeout)
+                if filled_size <= 0:
+                    print(f"  [SKIP] Order {order_id[:16]}... not filled — no position", flush=True)
+                    log_event("order_unfilled", {"order_id": order_id, "token_id": token_id})
+                    return
 
             # Use actual fill data for position tracking
             actual_cost = round(filled_size * fill_price, 4)
@@ -776,7 +786,66 @@ class LiveTrader:
         except Exception as e:
             log_event("order_error", {"error": str(e), "token_id": token_id})
             print(f"  [ORDER ERROR] {e}", flush=True)
+            # A network error (status_code=None) means the request was sent but no
+            # response came back — the order may have landed on Polymarket's end.
+            # Signal uncertainty to the caller so it can probe before allowing retries.
+            if isinstance(e, PolyApiException) and e.status_code is None:
+                return "UNCERTAIN"
             return None
+
+    async def _recover_position(self, token_id, buy_price):
+        """Probe for a position after a network error on order placement.
+
+        A status_code=None error means the HTTP request was sent but no response
+        came back — Polymarket may have received and processed the order. We check
+        two sources in priority order:
+
+          1. Conditional token balance — if > 0 the order filled (most common case,
+             since we price aggressively and orders typically match immediately).
+          2. get_orders (open orders) — fallback for slow-filling live orders.
+
+        Returns:
+            (filled_size, fill_price, order_id)  on success
+            (0, 0, None)                          if no position found
+        """
+        print(f"  [RECOVER] Network error on order — waiting 3s to check if it landed...", flush=True)
+        await asyncio.sleep(3.0)
+
+        # Step 1: token balance — covers immediate fills.
+        actual_balance = await self._get_token_balance(token_id)
+        if actual_balance is not None and actual_balance > 0:
+            print(f"  [RECOVER] Confirmed: {actual_balance:.4f} shares received — order landed and filled", flush=True)
+            log_event("order_recovered", {
+                "token_id": token_id, "method": "balance",
+                "shares": actual_balance, "approx_price": buy_price,
+            })
+            return actual_balance, buy_price, "recovered"
+
+        # Step 2: open orders — covers orders still resting on the book.
+        try:
+            loop = asyncio.get_running_loop()
+            orders = await loop.run_in_executor(
+                None, lambda: self.clob.get_orders(OpenOrderParams(asset_id=token_id))
+            )
+            for o in (orders or []):
+                if not isinstance(o, dict):
+                    continue
+                if o.get("side", "").upper() != "BUY":
+                    continue
+                recovered_id = o.get("id") or o.get("orderID") or o.get("order_id")
+                if not recovered_id:
+                    continue
+                print(f"  [RECOVER] Found live BUY order {str(recovered_id)[:16]}... — confirming fill", flush=True)
+                log_event("order_recovered", {"token_id": token_id, "method": "get_orders", "order_id": recovered_id})
+                filled_size, fill_price = await self._confirm_fill(recovered_id, max_wait=self.entry_order_timeout)
+                if filled_size > 0:
+                    return filled_size, fill_price, recovered_id
+        except Exception as e:
+            print(f"  [RECOVER] get_orders check failed: {e}", flush=True)
+
+        print(f"  [RECOVER] No position found — order did not land", flush=True)
+        log_event("order_recovered", {"token_id": token_id, "method": "none", "result": "not_found"})
+        return 0, 0, None
 
     async def _confirm_fill(self, order_id, max_wait=20.0):
         """Poll fill details for an order.
