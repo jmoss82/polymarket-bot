@@ -43,9 +43,9 @@ def _env_int(name, default):
         return int(default)
 
 BET_SIZE = _env_float("BET_SIZE", 5.0)           # dollars per trade — start small
-MIN_MOVE_PCT = _env_float("MIN_MOVE_PCT", 0.03)  # minimum BTC move % to consider (table handles the rest)
+MIN_MOVE_PCT = _env_float("MIN_MOVE_PCT", 0.05)  # minimum BTC move % to consider (table handles the rest)
 ENTRY_WINDOW = (
-    _env_int("ENTRY_START", 60),
+    _env_int("ENTRY_START", 600),
     _env_int("ENTRY_END", 840),
 )
 MIN_EDGE = _env_float("MIN_EDGE", 0.02)
