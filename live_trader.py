@@ -235,6 +235,7 @@ class IntervalState:
         self.tema_sell_attempts = 0     # cap retries on TEMA exit sells
         self.forced_sell_attempts = 0   # cap retries on forced exit sells (separate budget)
         self._sell_in_progress = False  # guard against concurrent sell attempts
+        self.last_bal_check_ts = 0.0    # rate-limit balance fallback in monitor loop
         self.tp_order_id = None         # resting GTC sell order for target price
         self.tema_exit_pending = False  # TEMA exit sell initiated
         self.exit_skip_logged = False   # True after first [EXIT SKIP] for current cross (throttle spam)
@@ -1326,8 +1327,11 @@ class LiveTrader:
 
                     # Fallback: CLOB sometimes reports size_matched=0 for filled orders.
                     # If open_shares is still high, check actual token balance to detect fills.
+                    # Rate-limited to once per 10s — this fires every monitor cycle otherwise.
                     open_shares_now = float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0)))
-                    if open_shares_now > DUST_THRESHOLD and status in ("MATCHED", "matched"):
+                    if (open_shares_now > DUST_THRESHOLD and status in ("MATCHED", "matched")
+                            and now - iv.last_bal_check_ts >= 10):
+                        iv.last_bal_check_ts = now
                         actual_bal = await self._get_token_balance(token_id)
                         if actual_bal is not None and actual_bal <= DUST_THRESHOLD:
                             filled_shares = open_shares_now - actual_bal
@@ -1462,7 +1466,7 @@ class LiveTrader:
                 print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — dust, using realized P&L ${realized_pnl:+.2f}", flush=True)
                 log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": realized_pnl})
                 iv.exited = True
-                iv.exit_reason = "target_fill" if realized_pnl > 0 else f"{reason}_below_min"
+                iv.exit_reason = reason if realized_pnl > 0 else f"{reason}_below_min"
                 iv.exit_pnl = realized_pnl
             else:
                 # No prior fills and real shares remain — DON'T mark exited.
@@ -1470,6 +1474,7 @@ class LiveTrader:
                 print(f"  [SELL SKIP] Order value ${order_value:.2f} < $1 min (have {shares} shares @ {floor_price}) — "
                       f"holding to resolution (no prior fills, {reason})", flush=True)
                 log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": 0, "held_to_resolution": True})
+            iv._sell_in_progress = False
             return
 
         if shares < POLY_MIN_SHARES:
@@ -1477,6 +1482,7 @@ class LiveTrader:
             print(f"  [SELL SKIP] Size {shares:.0f} < Polymarket min {POLY_MIN_SHARES} — "
                   f"holding to resolution ({reason})", flush=True)
             log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": realized_pnl, "min_size_block": True})
+            iv._sell_in_progress = False
             return
 
         try:
