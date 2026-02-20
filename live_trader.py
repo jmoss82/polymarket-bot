@@ -899,7 +899,9 @@ class LiveTrader:
                         last_price = price
 
                 # Do not treat any partial match as complete; wait for full size.
-                if original_size > 0 and size_matched >= original_size:
+                # Epsilon of 0.001 handles floating-point artifacts where Polymarket
+                # returns size_matched=7.999997 for an original_size=8.0 order.
+                if original_size > 0 and size_matched >= original_size - 0.001:
                     if avg_price == 0 and match_price == 0 and attempts < 3:
                         print("  [FILL] Full size matched but avg price pending — re-polling...", flush=True)
                         await asyncio.sleep(1.0)
