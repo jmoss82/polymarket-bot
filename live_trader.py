@@ -49,11 +49,11 @@ ENTRY_WINDOW = (
     _env_int("ENTRY_END", 840),
 )
 MIN_EDGE = _env_float("MIN_EDGE", 0.02)
-MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.95)
+MAX_ENTRY_PRICE = _env_float("MAX_ENTRY_PRICE", 0.89)     # must be below EXIT_TARGET_PRICE so we can profit
 
 # Exit logic
-EXIT_TARGET_PRICE = _env_float("EXIT_TARGET_PRICE", 0.95)  # resting GTC sell at this price
-EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 30)          # forced sell with 30s remaining
+EXIT_TARGET_PRICE = _env_float("EXIT_TARGET_PRICE", 0.90)  # resting GTC sell at this price
+EXIT_BEFORE_END = _env_int("EXIT_BEFORE_END", 45)          # forced sell with 45s remaining
 MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 2)         # check price every 2 seconds (logging only)
 
 # TEMA dynamic exit
@@ -1395,16 +1395,16 @@ class LiveTrader:
         iv._sell_in_progress = True
 
         # Separate attempt budgets so TEMA failures don't consume forced exit retries.
+        # Only count attempts when we actually post an order — skips (order value < $1,
+        # shares < POLY_MIN_SHARES) must not consume the budget so forced exit at 30s still runs.
         if reason == "forced_exit":
-            iv.forced_sell_attempts += 1
             attempts = iv.forced_sell_attempts
         else:
-            iv.tema_sell_attempts += 1
             attempts = iv.tema_sell_attempts
 
-        if attempts > MAX_SELL_ATTEMPTS:
-            iv._sell_in_progress = False  # reset before returning
-            print(f"  [SELL GAVE UP] {attempts - 1} failed {reason} attempts — marking exited", flush=True)
+        if attempts >= MAX_SELL_ATTEMPTS:
+            iv._sell_in_progress = False
+            print(f"  [SELL GAVE UP] {attempts} failed {reason} attempts — marking exited", flush=True)
             iv.exited = True
             iv.exit_reason = f"{reason}_failed"
             iv.exit_pnl = 0  # unknown, couldn't sell
@@ -1484,6 +1484,12 @@ class LiveTrader:
             log_event("sell_below_min", {"reason": reason, "shares": shares, "realized_pnl": realized_pnl, "min_size_block": True})
             iv._sell_in_progress = False
             return
+
+        # We're about to post an order — count this as one attempt (skips above do not count).
+        if reason == "forced_exit":
+            iv.forced_sell_attempts += 1
+        else:
+            iv.tema_sell_attempts += 1
 
         try:
             # Aggressive GTC limit sell. If not filled by timeout, cancel and retry.
@@ -1739,8 +1745,28 @@ class LiveTrader:
             ed = self.exit_tema.get_detail()
             print(f"Exit TEMA(5/12) on 1m: TEMA(5)=${ed['tema_fast']:,.2f} TEMA(12)=${ed['tema_slow']:,.2f} | {ed['trend']}", flush=True)
 
+        async def exit_watchdog():
+            """Time-based backup: force exit runs even when the price feed stops sending ticks.
+            If Chainlink (or Binance) goes quiet in the last 30s, _monitor_position is only
+            called from price ticks — so we'd hold to resolution. This task runs every 5s and
+            triggers the monitor when remaining <= exit_before_end."""
+            while True:
+                await asyncio.sleep(5)
+                iv = self.current_interval
+                if iv is None:
+                    continue
+                if not (iv.trade_taken and iv.trade and not iv.exited):
+                    continue
+                if iv.remaining <= self.exit_before_end:
+                    print(f"  [WATCHDOG] Forced-exit window ({iv.remaining:.0f}s left) — triggering monitor (price feed may be stale)", flush=True)
+                    try:
+                        await self._monitor_position(iv)
+                    except Exception as e:
+                        log_event("error", {"context": "exit_watchdog", "error": str(e)})
+                        print(f"  [WATCHDOG ERR] {e}", flush=True)
+
         try:
-            await self.feed.start()
+            await asyncio.gather(self.feed.start(), exit_watchdog())
         finally:
             if self._http and not self._http.closed:
                 await self._http.close()

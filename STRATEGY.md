@@ -123,7 +123,7 @@ Edge is rounded to 4 decimal places to avoid IEEE 754 floating-point precision i
 All of these must pass before an order is placed:
 
 1. **Edge >= 0.02** — the calibrated fair value must exceed the buy price by at least 2 cents
-2. **Buy price <= 0.95** — don't buy shares priced above 95 cents
+2. **Buy price <= 0.89** — don't buy shares priced above 89 cents (kept below exit target so we can profit)
 3. **Spread <= 0.06** — skip if bid/ask spread exceeds 6 cents (liquidity too thin)
 4. **HTF EMA aligned** — signal direction must match the higher-timeframe EMA trend
 5. **Not first interval** — skip the partial interval after startup
@@ -195,7 +195,7 @@ If the initial TEMA exit sell fails (rejected or unfilled), the position remains
 
 ### 2. Target Price Sell (Profit Taking)
 
-Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed target price (default $0.95). This sits on the book and fills automatically if the share price reaches the target.
+Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed target price (default $0.90). This sits on the book and fills automatically if the share price reaches the target.
 
 - **Non-blocking placement**: Placed by the monitor loop, not inline after the buy, to avoid blocking the price feed during settlement.
 - **Settlement grace period**: Waits 5 seconds after buy fill before first attempt (tokens must settle on-chain).
@@ -226,8 +226,8 @@ If neither the TEMA exit nor the target sell has fully closed the position with 
 
 - **No percentage-based TP/SL**: Old approach capped upside (TP at 25%) or exited on noise (SL at 25%). Share price swings early in an interval don't mean much — what matters is final direction.
 - **TEMA catches real reversals**: Unlike a fixed stop loss, the TEMA cross responds to actual trend changes in the underlying, not share price noise.
-- **Fixed target at $0.95**: Lets winners run close to their maximum value without holding into the volatile final seconds.
-- **Time-based SL at 30s**: If we haven't exited by the last 30 seconds, sell to limit damage rather than risk binary resolution.
+- **Fixed target at $0.90**: Lock in gains earlier; reduces exposure to late reversals.
+- **Time-based SL at 45s**: If we haven't exited by the last 45 seconds, sell to limit damage rather than risk binary resolution.
 
 ### Resolution After Early Exit
 
@@ -257,7 +257,7 @@ Default: stop after **$15 cumulative loss** (`MAX_SESSION_LOSS`).
 
 1. **Single trade per interval**: No re-entry after early exit
 2. **REST polling for monitoring**: CLOB prices checked every 2s via REST, not WebSocket
-3. **Target price is static**: $0.95 may not be optimal for all market conditions — may need dynamic adjustment based on entry price
+3. **Target price is static**: $0.90 (configurable) may not be optimal for all market conditions — may need dynamic adjustment based on entry price
 4. **Coinbase-calibrated, not Chainlink-calibrated**: Fair value table uses Coinbase BTC-USD data as a proxy for Chainlink (resolution oracle). Basis risk is ~0.01% ($10 at $97k)
 5. **Settlement lag is unpredictable**: Target sell placement depends on on-chain settlement speed, which varies
 6. **Session-unaware**: No blackout for low-performance time windows (e.g., afternoon hours showed 45% win rate in paper testing)
@@ -310,15 +310,15 @@ All parameters can be overridden via environment variables in Railway.
 | Entry start | `ENTRY_START` | 60s | Earliest second in the interval to enter |
 | Entry end | `ENTRY_END` | 840s | Latest second in the interval to enter |
 | Min edge | `MIN_EDGE` | 0.02 | Minimum edge (fair - buy price) to take a trade |
-| Max entry price | `MAX_ENTRY_PRICE` | 0.95 | Don't buy shares priced above this |
+| Max entry price | `MAX_ENTRY_PRICE` | 0.89 | Don't buy above this (must be below exit target) |
 | Max spread | `MAX_SPREAD` | 0.06 | Skip entry if bid/ask spread exceeds this |
 
 ### Exit Parameters
 
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
-| Target price | `EXIT_TARGET_PRICE` | 0.95 | Resting GTC sell price (profit taking) |
-| Forced exit | `EXIT_BEFORE_END` | 30s | Force sell with this many seconds remaining |
+| Target price | `EXIT_TARGET_PRICE` | 0.90 | Resting GTC sell price (profit taking) |
+| Forced exit | `EXIT_BEFORE_END` | 45s | Force sell with this many seconds remaining |
 | Monitor interval | `MONITOR_INTERVAL` | 2s | How often to check position and try target sell placement |
 | TEMA exit start | `EXIT_MONITOR_START` | 600s | Seconds into interval before TEMA exit becomes active |
 | TEMA cushion | `EXIT_CUSHION_PCT` | 0.05% | Skip TEMA exit if winning by more than this vs open |
