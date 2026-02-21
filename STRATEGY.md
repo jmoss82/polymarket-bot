@@ -168,9 +168,9 @@ Before placing any sell order, the bot queries the actual conditional token bala
 
 ---
 
-## Exit Logic (Three Exit Paths)
+## Exit Logic (Four Exit Paths)
 
-After entering a position, the bot uses three exit mechanisms in priority order:
+After entering a position, the bot uses four exit mechanisms in priority order:
 
 ### 1. TEMA Dynamic Exit (Smart Stop Loss)
 
@@ -193,7 +193,15 @@ A 1-minute TEMA(5)/TEMA(12) crossover detects when the short-term trend turns ag
 **Retry behavior:**
 If the initial TEMA exit sell fails (rejected or unfilled), the position remains open and the monitor loop retries the sell every 2 seconds (`MONITOR_INTERVAL`) until it succeeds, the 3-attempt budget is exhausted, or the forced exit window opens. TEMA exit and forced exit have **separate** 3-attempt budgets so early failures don't block the safety net.
 
-### 2. Target Price Sell (Profit Taking)
+### 2. Loss-Cap Exit (Fire Sell)
+
+When the position's mark-to-market P&L (share price vs entry) falls to or below a threshold (default **-50%**), the bot cancels the resting target sell and places an aggressive sell immediately. This caps the size of a single loss so one bad trade doesn't wipe out multiple wins.
+
+- **Threshold**: `EXIT_LOSS_CAP_PCT` (e.g. `-0.50`). Set to `0` to disable.
+- **Price used**: CLOB midpoint, checked every monitor cycle (2s).
+- **Same attempt budget as TEMA** (early exits share 3 attempts).
+
+### 3. Target Price Sell (Profit Taking)
 
 Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed target price (default $0.90). This sits on the book and fills automatically if the share price reaches the target.
 
@@ -204,9 +212,9 @@ Immediately after a buy fills, the bot places a **resting GTC SELL** at a fixed 
 - **Balance verification**: Queries actual token balance and adjusts sell quantity to match.
 - **Partial-fill accounting**: Resting target sells can fill in chunks; each newly matched delta is booked immediately and reduces tracked `open_shares`.
 
-### 3. Forced Exit (Safety Net)
+### 4. Forced Exit (Safety Net)
 
-If neither the TEMA exit nor the target sell has fully closed the position with **30 seconds remaining** before resolution:
+If none of the above has fully closed the position with **45 seconds remaining** before resolution:
 
 1. Cancel the resting target sell (if active)
 2. Re-read target order state after cancel and book any matched delta not yet accounted for
@@ -224,7 +232,7 @@ If neither the TEMA exit nor the target sell has fully closed the position with 
 
 ### Why This Strategy
 
-- **No percentage-based TP/SL**: Old approach capped upside (TP at 25%) or exited on noise (SL at 25%). Share price swings early in an interval don't mean much — what matters is final direction.
+- **Loss cap at -50%**: Limits single-trade downside so one full loss doesn't erase multiple wins; checked every 2s via CLOB mid.
 - **TEMA catches real reversals**: Unlike a fixed stop loss, the TEMA cross responds to actual trend changes in the underlying, not share price noise.
 - **Fixed target at $0.90**: Lock in gains earlier; reduces exposure to late reversals.
 - **Time-based SL at 45s**: If we haven't exited by the last 45 seconds, sell to limit damage rather than risk binary resolution.
@@ -233,7 +241,7 @@ If neither the TEMA exit nor the target sell has fully closed the position with 
 
 When the interval ends:
 
-- If **already sold** (TEMA, target, or forced): uses realized sell P&L and logs what would've happened if held
+- If **already sold** (TEMA, loss cap, target, or forced): uses realized sell P&L and logs what would've happened if held
 - If **partially sold**: carries realized P&L from sold shares, then settles only remaining `open_shares` at binary resolution
 - If **fully held**: uses binary win/lose logic on full size
 
@@ -318,6 +326,7 @@ All parameters can be overridden via environment variables in Railway.
 | Parameter | Env Var | Default | Description |
 |-----------|---------|---------|-------------|
 | Target price | `EXIT_TARGET_PRICE` | 0.90 | Resting GTC sell price (profit taking) |
+| Loss cap | `EXIT_LOSS_CAP_PCT` | -0.50 | Fire sell when position P&L ≤ this (0 = disabled) |
 | Forced exit | `EXIT_BEFORE_END` | 45s | Force sell with this many seconds remaining |
 | Monitor interval | `MONITOR_INTERVAL` | 2s | How often to check position and try target sell placement |
 | TEMA exit start | `EXIT_MONITOR_START` | 600s | Seconds into interval before TEMA exit becomes active |

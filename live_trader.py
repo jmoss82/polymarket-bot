@@ -60,6 +60,9 @@ MONITOR_INTERVAL = _env_int("MONITOR_INTERVAL", 2)         # check price every 2
 EXIT_MONITOR_START = _env_int("EXIT_MONITOR_START", 600)     # seconds into interval before TEMA exit active
 EXIT_CUSHION_PCT = _env_float("EXIT_CUSHION_PCT", 0.05)      # don't TEMA-exit if winning by more than this %
 
+# Loss-cap exit — fire sell when position is down this much (share price vs entry). Set to 0 to disable.
+EXIT_LOSS_CAP_PCT = _env_float("EXIT_LOSS_CAP_PCT", -0.50)  # e.g. -0.50 = sell when down 50%
+
 # Dust threshold — truncation + fees leave unsellable fractional shares.
 # Treat anything below this as "position closed."
 DUST_THRESHOLD = 0.01
@@ -295,6 +298,7 @@ class LiveTrader:
         self.max_entry_price = MAX_ENTRY_PRICE
         self.exit_target_price = EXIT_TARGET_PRICE
         self.exit_before_end = EXIT_BEFORE_END
+        self.exit_loss_cap_pct = EXIT_LOSS_CAP_PCT
         self.monitor_interval = MONITOR_INTERVAL
         self.max_session_loss = MAX_SESSION_LOSS
         self.max_spread = MAX_SPREAD
@@ -1376,6 +1380,38 @@ class LiveTrader:
             current_price = await self._get_clob_midpoint(token_id)
             if current_price and current_price > 0:
                 position_pnl_pct = (current_price - entry_price) / entry_price
+
+                # Loss-cap exit — fire sell when position is down by this much (e.g. -50%)
+                if self.exit_loss_cap_pct < 0 and position_pnl_pct <= self.exit_loss_cap_pct:
+                    print(f"\n  >> LOSS CAP | position P&L {position_pnl_pct:+.1%} <= {self.exit_loss_cap_pct:.0%} | selling now",
+                          flush=True)
+                    log_event("loss_cap_exit", {
+                        "slug": iv.slug, "entry_price": entry_price, "current_price": current_price,
+                        "position_pnl_pct": position_pnl_pct, "threshold": self.exit_loss_cap_pct,
+                    })
+                    if iv.tp_order_id:
+                        tp_id = iv.tp_order_id
+                        try:
+                            loop = asyncio.get_running_loop()
+                            await loop.run_in_executor(None, lambda: self.clob.cancel(tp_id))
+                            print(f"  [LOSS CAP] Cancelled resting sell {tp_id[:16]}...", flush=True)
+                            order = await loop.run_in_executor(None, lambda: self.clob.get_order(tp_id))
+                            if order:
+                                if isinstance(order, dict):
+                                    sm = float(order.get("size_matched", 0))
+                                    ra = order.get("average_matched_price")
+                                else:
+                                    sm = float(getattr(order, "size_matched", 0))
+                                    ra = getattr(order, "average_matched_price", None)
+                                self._apply_target_match_delta(iv, sm, ra)
+                        except Exception as e:
+                            print(f"  [LOSS CAP] Cancel resting sell failed: {e}", flush=True)
+                        iv.tp_order_id = None
+                    remaining_shares = float(iv.trade.get("open_shares", iv.trade.get("shares", 0.0)))
+                    if remaining_shares > DUST_THRESHOLD:
+                        await self._sell_position(iv, reason="loss_cap")
+                    return
+
                 resting = f" | target @ {self.exit_target_price}" if iv.tp_order_id else " | NO resting sell"
                 print(f"  [MON] {iv.trade['side']} | entry {entry_price:.3f} -> {current_price:.3f} | P&L {position_pnl_pct:+.1%} | {iv.remaining:.0f}s left{resting}", flush=True)
 
@@ -1718,7 +1754,7 @@ class LiveTrader:
         print(f"Bet: ${self.bet_size} | Min move: {self.min_move_pct}% | Window: {self.entry_window[0]}-{self.entry_window[1]}s")
         print(f"Edge: >= {self.min_edge} | Max price: {self.max_entry_price}")
         print(f"Entry filter: HTF EMA(5) on 15m candles")
-        print(f"Exit: Target sell @ {self.exit_target_price} | Forced @ {self.exit_before_end}s before end | Monitor every {self.monitor_interval}s")
+        print(f"Exit: Target @ {self.exit_target_price} | Loss cap @ {self.exit_loss_cap_pct:.0%} | Forced @ {self.exit_before_end}s | Monitor every {self.monitor_interval}s")
         print(f"TEMA exit: 1m TEMA(5)/TEMA(12) cross after {EXIT_MONITOR_START}s | cushion skip > {EXIT_CUSHION_PCT}%")
         print(f"Order fills: entry timeout {self.entry_order_timeout:.0f}s | exit timeout {self.exit_order_timeout:.0f}s")
         print(f"Risk: Max session loss ${self.max_session_loss:.0f} | Max spread: {self.max_spread:.2f}")
