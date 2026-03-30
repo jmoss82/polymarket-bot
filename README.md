@@ -1,25 +1,32 @@
-# Polymarket 15-Min Up/Down Bot
+# Polymarket Bot
 
 ## Setup
 
 1. Copy `.env.example` → `.env` and fill in your keys
 2. Install deps: `pip install -r requirements.txt`
 3. Discover active markets: `python discover_markets.py`
-4. Run data collector: `python collector.py`
 
 ## Architecture
 
 ```
-binance_ws.py      → Real-time BTC/ETH price feed from Binance
-polymarket_ws.py   → Order book + trade feed from Polymarket CLOB
-discover_markets.py → Find active 15-min Up/Down market IDs
-collector.py       → Phase 1: Dual-feed data collection & logging
-config.py          → Environment config loader
+config.py           → Environment config loader (.env)
+discover_markets.py → Find active market IDs via Gamma API
+polymarket_ws.py    → Order book + trade feed from Polymarket CLOB
+set_allowances.py   → On-chain token approvals (USDC + CTF)
+derive_creds.py     → Derive API credentials (IP-bound)
+check_balance.py    → Check wallet balance
+check_pk.py         → Validate private key setup
 ```
 
-## Phases
+## Testing
 
-- [x] Phase 1: Data collection (Binance + Polymarket WebSockets)
-- [ ] Phase 2: Signal generation (mispricing detection)
-- [ ] Phase 3: Execution (maker orders via py-clob-client)
-- [ ] Phase 4: Deploy (Railway / Digital Ocean)
+```
+e2e_test.py    → End-to-end order placement test
+test_auth.py   → Authentication test
+test_order.py  → Order placement test
+test_slug.py   → Market slug discovery test
+```
+
+## Deploy
+
+Railway (EU West) — auto-deploys on push to `main`.
