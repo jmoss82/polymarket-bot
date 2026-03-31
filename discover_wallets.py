@@ -11,6 +11,7 @@ Usage:
 import asyncio
 import aiohttp
 import argparse
+import csv
 import json
 import os
 import sys
@@ -150,10 +151,30 @@ async def run_discovery(args):
 
         # Save results
         os.makedirs(DATA_DIR, exist_ok=True)
-        out_path = os.path.join(DATA_DIR, "wallet_rankings.json")
-        with open(out_path, "w") as f:
+        json_path = os.path.join(DATA_DIR, "wallet_rankings.json")
+        with open(json_path, "w") as f:
             json.dump(ranked, f, indent=2)
-        print(f"\n  Saved {len(ranked)} results to {out_path}", flush=True)
+
+        csv_path = os.path.join(DATA_DIR, "wallet_rankings.csv")
+        csv_fields = [
+            "proxy_wallet", "userName", "lb_rank", "win_rate", "wins", "losses",
+            "total_resolved", "total_pnl", "avg_pnl", "avg_win", "avg_loss",
+            "crypto_ratio", "crypto_positions", "open_position_count",
+            "portfolio_value", "trades_per_day", "distinct_markets",
+            "lb_pnl", "lb_vol",
+        ]
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_fields, extrasaction="ignore")
+            writer.writeheader()
+            for w in ranked:
+                row = dict(w)
+                row["win_rate"] = f"{row['win_rate']:.4f}"
+                row["crypto_ratio"] = f"{row['crypto_ratio']:.4f}"
+                writer.writerow(row)
+
+        print(f"\n  Saved {len(ranked)} results to:", flush=True)
+        print(f"    {json_path}", flush=True)
+        print(f"    {csv_path}", flush=True)
 
 
 async def run_detail(args):
