@@ -12,13 +12,6 @@ POLY_FUNDER = os.getenv("POLY_FUNDER")
 CHAIN_ID = int(os.getenv("CHAIN_ID", "137"))
 CLOB_HOST = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 
-# Binance WebSocket
-BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
-BINANCE_STREAMS = {
-    "BTC": "btcusdt@trade",
-    "ETH": "ethusdt@trade",
-}
-
 # Logging
 LOG_DIR = "logs"
 DATA_DIR = "data"
